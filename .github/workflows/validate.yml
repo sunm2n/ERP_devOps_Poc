@@ -34,11 +34,20 @@ jobs:
       - name: 시크릿 패턴 검사
         run: |
           # 커밋된 자격증명을 막는 최소한의 그물. 완전하지 않다.
+          inc=(--include='*.yml' --include='*.yaml' --include='*.sh' --include='*.json'
+               --include='*.cs' --include='*.env' --include='*.asc' --include='*.gpg'
+               --include='*.key' --include='*.pem')
+
           if grep -rInE '(password|passwd|secret|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/_+.-]{8,}' \
-               --include='*.yml' --include='*.yaml' --include='*.sh' --include='*.json' \
-               --include='*.cs' --include='*.env' . \
+               "${inc[@]}" . \
              | grep -vE '(example|sample|placeholder|CHANGE_?ME|\$\{|\$CI_|<.*>)'; then
             echo "::error::시크릿으로 보이는 값이 커밋되었습니다"
+            exit 1
+          fi
+
+          # armored 개인키 블록. 번들 서명 키가 새면 폐쇄망 고객사에서는 검출 불가능하다.
+          if grep -rIn 'BEGIN [A-Z ]*PRIVATE KEY' "${inc[@]}" .; then
+            echo "::error::개인키가 커밋되었습니다"
             exit 1
           fi
           echo "이상 없음"
