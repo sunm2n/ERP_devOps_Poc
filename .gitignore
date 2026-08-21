@@ -1,0 +1,23 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+artifacts/
+
+# PoC 산출물 (저장소에 올리지 않음 — 크기 문제)
+bundles/*.tar
+bundles/*.tar.gz
+*.docker.tar
+
+# 측정 원본 로그
+measurements/raw/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 시크릿
+*.env
+!*.env.example
+secrets/
