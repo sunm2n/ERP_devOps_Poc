@@ -11,7 +11,8 @@ bundles/*.tar.gz
 *.docker.tar
 
 # 측정 원본 로그 — pcap 에는 DB 접속 시도·호스트명·내부 IP 가 들어간다
-measurements/raw/
+measurements/raw/*
+!measurements/raw/.gitkeep
 *.pcap
 *.pcapng
 
