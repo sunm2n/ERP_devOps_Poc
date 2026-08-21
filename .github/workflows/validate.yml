@@ -34,11 +34,23 @@ jobs:
       - name: 시크릿 패턴 검사
         run: |
           # 커밋된 자격증명을 막는 최소한의 그물. 완전하지 않다.
+          # include 를 걸지 않는다. 이 저장소는 콘텐츠 대부분이 *.md 이고 *.key/*.pem
+          # 등은 .gitignore 가 이미 막으므로, 확장자 목록은 커버리지를 넓히는 게 아니라
+          # 오히려 좁힌다. 실제로 새는 경로는 런북 docs/*.md, scripts/*.py, 이슈 본문,
+          # 확장자 없는 id_rsa 쪽이다.
           if grep -rInE '(password|passwd|secret|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/_+.-]{8,}' \
-               --include='*.yml' --include='*.yaml' --include='*.sh' --include='*.json' \
-               --include='*.cs' --include='*.env' . \
+               --exclude-dir=.git . \
              | grep -vE '(example|sample|placeholder|CHANGE_?ME|\$\{|\$CI_|<.*>)'; then
             echo "::error::시크릿으로 보이는 값이 커밋되었습니다"
+            exit 1
+          fi
+
+          # armored 개인키 블록. 번들 서명 키가 새면 폐쇄망 고객사에서는 검출 불가능하다.
+          # 런북에 금지 예시로 적는 경우가 있어 example 계열은 예외로 둔다 —
+          # 예외가 없으면 CI 가 영구 실패하고 우회 경로가 없다.
+          if grep -rIn --exclude-dir=.git 'BEGIN [A-Z ]*PRIVATE KEY' . \
+             | grep -vE '(example|EXAMPLE|sample|placeholder|<.*>)'; then
+            echo "::error::개인키가 커밋되었습니다"
             exit 1
           fi
           echo "이상 없음"

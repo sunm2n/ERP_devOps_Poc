@@ -10,14 +10,21 @@ bundles/*.tar
 bundles/*.tar.gz
 *.docker.tar
 
-# 측정 원본 로그
+# 측정 원본 로그 — pcap 에는 DB 접속 시도·호스트명·내부 IP 가 들어간다
 measurements/raw/
+*.pcap
+*.pcapng
 
 # OS
 .DS_Store
 Thumbs.db
 
-# 시크릿
+# 시크릿 — 번들 서명 키가 공개되면 누구나 우리 이름으로 배포 번들에 서명할 수 있다
 *.env
 !*.env.example
 secrets/
+*.asc
+*.gpg
+*.key
+*.pem
+!*.pub.asc
