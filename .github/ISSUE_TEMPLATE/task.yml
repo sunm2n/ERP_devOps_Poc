@@ -1,0 +1,36 @@
+name: PoC 작업
+description: plan.md의 실행 단계에서 파생된 작업 하나
+title: "[P?] "
+labels: []
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: 목표
+      description: 이 작업이 끝났을 때 무엇이 존재하는가. 한 문장.
+    validations: {required: true}
+  - type: input
+    id: hypothesis
+    attributes:
+      label: 대상 가설
+      description: "H1~H8 중 어느 것에 기여하는가. 없으면 '없음(하네스/문서)'"
+    validations: {required: true}
+  - type: textarea
+    id: done
+    attributes:
+      label: 완료 조건
+      description: 참/거짓으로 판정 가능하게. 체크박스로.
+      value: |
+        - [ ] 
+    validations: {required: true}
+  - type: textarea
+    id: deps
+    attributes:
+      label: 선행 이슈
+      description: "#번호로 나열. 없으면 '없음'."
+    validations: {required: true}
+  - type: textarea
+    id: notes
+    attributes:
+      label: 비고
+      description: 판단이 필요한 지점, plan.md와 다르게 가는 부분

@@ -1,0 +1,63 @@
+name: validate
+
+# 이 워크플로는 산출물의 **정적 검증만** 한다.
+# .gitlab-ci.yml은 GitLab CE에서 실행된다 — 여기서 초록불이 떠도
+# GitLab 파이프라인이 동작한다는 뜻이 아니다. README '저장소 경계' 참조.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          found=$(find . -name '*.sh' -not -path './.git/*')
+          if [ -z "$found" ]; then echo "셸 스크립트 없음 — 건너뜀"; exit 0; fi
+          echo "$found" | xargs shellcheck --severity=warning
+
+      - name: yamllint
+        run: |
+          pipx install yamllint
+          yamllint -d '{extends: relaxed, rules: {line-length: {max: 140}}}' \
+            $(find . -name '*.yml' -o -name '*.yaml' | grep -v '^./.git/')
+
+      - name: 시크릿 패턴 검사
+        run: |
+          # 커밋된 자격증명을 막는 최소한의 그물. 완전하지 않다.
+          if grep -rInE '(password|passwd|secret|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/_+.-]{8,}' \
+               --include='*.yml' --include='*.yaml' --include='*.sh' --include='*.json' \
+               --include='*.cs' --include='*.env' . \
+             | grep -vE '(example|sample|placeholder|CHANGE_?ME|\$\{|\$CI_|<.*>)'; then
+            echo "::error::시크릿으로 보이는 값이 커밋되었습니다"
+            exit 1
+          fi
+          echo "이상 없음"
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          if [ -d src ] && find src -name '*.csproj' | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "src/ 에 .csproj 없음 — 빌드 건너뜀"
+          fi
+      - uses: actions/setup-dotnet@v4
+        if: steps.check.outputs.exists == 'true'
+        with:
+          dotnet-version: '10.0.x'
+      - if: steps.check.outputs.exists == 'true'
+        run: dotnet build src --configuration Release
