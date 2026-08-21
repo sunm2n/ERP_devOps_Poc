@@ -101,43 +101,25 @@ H3 `값` 이 원계수인지 초과분인지 구분된다. B·C 의 egress 가 �
 
 ### 판정 명령
 
-**DNS 로그는 `--since` 를 받지 못한다.** 창을 열 때 `truncate -s 0 /var/log/dnsmasq.log`,
-닫을 때 `cp` 로 `raw/<창>-dns.log` 에 반출한다. 자르지 않으면 창 B·C 와 baseline 질의가
-전부 창 A 값에 섞이는데, 표에서는 그게 안 보인다.
+**명령의 정본은 [`plan.md` 3장](../plan.md) 하나다. 여기에 복제하지 않는다.**
 
-```sh
-# IPv4 — 유일 목적지 (IP, 포트). 포트 없는 프로토콜은 PROTO 로 대체
-journalctl _TRANSPORT=kernel --since "<창 시작>" --until "<창 종료>" \
-  | grep 'EGRESS-TRY4:' \
-  | awk '{d=p=r="";for(i=1;i<=NF;i++){if($i~/^DST=/)d=$i;else if($i~/^DPT=/)p=$i;else if($i~/^PROTO=/)r=$i}
-          if(d!="")print d,(p!=""?p:r)}' \
-  | sort -u | wc -l
+복제해 두었더니 두 번 사고가 났다 — IPv6 블록의 `awk` 축약이 한쪽에만 고쳐졌고,
+DNS 명령이 정본 쪽에만 낡은 채 남았다. 둘 다 실행하면 `0` 이 찍히는 형태였고
+목표치도 `0` 이라 아무도 다시 안 봤을 것이다. 그래서 사본을 없앤다.
 
-# IPv6 — 접두어만 다르다. awk 본문을 줄이지 말 것: '...위와 동일...' 을 그대로 쓰면
-# awk syntax error 가 나고 stdout 은 비어 0 이 찍힌다
-journalctl _TRANSPORT=kernel --since "<창 시작>" --until "<창 종료>" \
-  | grep 'EGRESS-TRY6:' \
-  | awk '{d=p=r="";for(i=1;i<=NF;i++){if($i~/^DST=/)d=$i;else if($i~/^DPT=/)p=$i;else if($i~/^PROTO=/)r=$i}
-          if(d!="")print d,(p!=""?p:r)}' \
-  | sort -u | wc -l
+정본에서 가져와 쓸 때 필요한 준비만 여기 적는다.
 
-# DNS 유일 질의 이름. 창을 열 때 truncate, 닫을 때 raw/ 로 반출한 로그를 읽는다
-# 필드 위치($6)에 의존하지 말 것: syslog 경유면 호스트명이 붙어 $6 이 'query[A]' 가 되고
-# 이름 3개가 나가도 값은 1 로 찍힌다 (실증됨)
-awk '{for(i=1;i<=NF;i++) if($i ~ /^query\[/){print $(i+1); break}}' raw/window-a-dns.log \
-  | sort -u | wc -l
+| 무엇 | 준비 |
+| --- | --- |
+| `--since` / `--until` | 위 계수 창 대장의 시작·종료시각 |
+| DNS 로그 | 창 열 때 `truncate -s 0 /var/log/dnsmasq.log`, 닫을 때 `cp` 로 `raw/<창>-dns.log` |
+| pcap | `-w raw/<창>.pcap` 로 띄운다. 회전되면 `raw/<창>.pcap0`, `.pcap1` … 이 되고 판정은 glob 로 반복한다 |
+| pcap 파일 수 | 창을 닫을 때 **10 미만인지 확인해 대장에 적는다.** `-W 10` 은 상한이 아니라 링버퍼라 10이면 초반 증거가 지워졌다 |
 
-# pcap 교차 확인 (IPv4 전용) — 필터 문자열 안에 백슬래시를 넣지 말 것
-tcpdump -r raw/window-a.pcap 'tcp[tcpflags] & tcp-syn != 0 and not dst net 10.0.0.0/8 and not dst net 172.16.0.0/12 and not dst net 192.168.0.0/16 and not dst host 127.0.0.1'
-```
-
-**세 가지를 틀리기 쉽고, 셋 다 결과가 `0` 으로 보인다. 목표치도 `0` 이라 아무도 의심하지 않는다.**
-
-- **`journalctl -k` 금지** — `--boot=0` 을 암시해서 `--since` 를 과거로 잡아도 현재 부팅분 밖은 안 나온다. `Storage=persistent` 로 살려둔 로그를 판정에서 스스로 버리게 된다
-- **필터 문자열 안 백슬래시 금지** — 작은따옴표 안의 `\` 는 문자 그대로 libpcap 에 가서 `can't parse filter expression: syntax error`. `| wc -l` 로 감싸면 stderr 로 새고 `0` 이 찍힌다
-- **`sed` 치환으로 뽑지 말 것** — `-n`/`p` 없이 쓰면 매칭 안 되는 줄(포트 없는 ICMP 등)이 타임스탬프째 통과해 계수가 부푼다. 위 `awk` 는 검증됨 (TCP 3 + ICMP 2 + UDP 1 패킷 → `3`)
-
-**종료코드를 확인한다.** `wc -l` 은 앞단이 죽어도 `0` 을 찍는다. `set -o pipefail` 을 걸거나 단계를 따로 돌린다.
+**판정값 `0` 은 항상 "앞단이 죽어서 0" 을 먼저 배제하고 기록한다.**
+`wc -l` 은 앞단이 죽어도 `0` 을 찍고, `set -o pipefail` 로도 부족하다 —
+프로세스 치환(`<(...)`)의 실패는 파이프라인 종료 상태에 들어가지 않는다(실증: exit 0, 출력 0).
+중간 산출물의 줄 수를 눈으로 확인한 뒤 계수하라.
 
 > 시도가 1건이라도 있으면 무엇인지 규명한다. NuGet, 이미지 pull, 라이선스 확인,
 > 시간 동기화, **OCSP/CRL** 이 흔하다. 규명 결과를 적을 때 실주소를 쓰지 말고 자리표시자를 쓴다.
