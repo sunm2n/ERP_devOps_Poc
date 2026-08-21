@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | GitHub (여기) | 이슈 · PR · 리뷰 · 머지 | 작업 관리와 산출물 형상관리 |
 | GitLab CE (self-managed) | 실제 CI 파이프라인 | `.gitlab-ci.yml`은 여기서 **리뷰만** 받고 실행은 GitLab |
-| VM-1 / VM-2 | 설치 · 업그레이드 · 롤백 | 수동 실행, 결과는 `type:env` 이슈에 기록 |
+| VM-1 / VM-2 | 설치 · 업그레이드 · 롤백 | 수동 실행. 수치는 [`measurements/metrics.md`](measurements/metrics.md), 원인·설계영향은 [`docs/findings.md`](docs/findings.md), 진행은 `type:env` 이슈 |
 
 GitHub Actions는 `.gitlab-ci.yml`과 셸 스크립트의 **정적 검증만** 수행한다.
 PR이 초록불이라고 GitLab 파이프라인이 동작한다는 뜻이 아니다.
@@ -25,3 +25,13 @@ PR이 초록불이라고 GitLab 파이프라인이 동작한다는 뜻이 아니
 
 이슈 → PR → 3개 관점 리뷰 → 머지 → 다음 이슈. 자세한 내용은
 [`docs/harness.md`](docs/harness.md).
+
+## 기록
+
+| 파일 | 무엇이 들어가는가 |
+| --- | --- |
+| [`measurements/metrics.md`](measurements/metrics.md) | 지표 수치. **측정한 자리에서** 채운다 |
+| [`docs/findings.md`](docs/findings.md) | 가설 판정, 실패 원인, 설계 영향, 도입 권고 |
+
+보고서(6장 산출물)는 전적으로 이 둘에서 나온다. 4단계에 2~3일뿐이라 그때 재현하려면
+VM-2 스냅샷 복구부터 다시 해야 한다.
