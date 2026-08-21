@@ -21,7 +21,7 @@ body:
       label: 완료 조건
       description: 참/거짓으로 판정 가능하게. 체크박스로.
       value: |
-        - [ ] 
+        - [ ] 참/거짓으로 판정 가능한 조건
     validations: {required: true}
   - type: textarea
     id: deps
