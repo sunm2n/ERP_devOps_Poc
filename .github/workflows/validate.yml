@@ -46,7 +46,9 @@ jobs:
           fi
 
           # armored 개인키 블록. 번들 서명 키가 새면 폐쇄망 고객사에서는 검출 불가능하다.
-          if grep -rIn 'BEGIN [A-Z ]*PRIVATE KEY' "${inc[@]}" .; then
+          # include 를 걸지 않는다 — *.key/*.pem 등은 .gitignore 가 이미 막으므로
+          # 실제로 새는 경로는 확장자 없는 id_rsa, 런북 docs/*.md, 이슈 템플릿 쪽이다.
+          if grep -rIn --exclude-dir=.git 'BEGIN [A-Z ]*PRIVATE KEY' .; then
             echo "::error::개인키가 커밋되었습니다"
             exit 1
           fi
