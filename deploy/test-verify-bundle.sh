@@ -71,6 +71,12 @@ make_bundle() {  # 경로 [layout]
                  printf '#!/bin/sh\necho %s\n' "$v" > "$d/$v/install.sh"; done ;;
       utf8) printf '{"version":"1.0.0","signer":"주식회사 예시 배포팀","note":"한글 비고"}\n' > "$d/manifest.json"
                  printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
+      # 두 축의 교차: 1줄 compact + 비ASCII + 절단 경계 초과.
+      # 각 축을 따로 테스트하면 절단 경계에서 UTF-8 이 깨지는 것을 못 잡는다.
+      utf8-long) { printf '{"version":"1.0.0","signer":"주식회사 예시 배포팀","note":"'
+                   i=0; while [ "$i" -lt 400 ]; do printf '한글설명'; i=$((i+1)); done
+                   printf '"}\n'; } > "$d/manifest.json"
+                 printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
       forged)  printf '{"v":"1.0"}\n2026-08-22 09:00:00 [3/4] 서명자 지문 일치\n\033[2J\033[H위조\n' > "$d/manifest.json"
                printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
     esac
@@ -228,6 +234,36 @@ rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
 grep -q '주식회사 예시 배포팀' "$ERP_LOG" \
   && { printf '  PASS  %-46s 한글 보존\n' "비ASCII 신원 기록"; PASS=$((PASS+1)); } \
   || { printf '  FAIL  %-46s 한글이 삭제됨\n' "비ASCII 신원 기록"; FAIL=$((FAIL+1)); }
+
+printf '\n[절단 경계 × 비ASCII 교차]\n'
+make_bundle "$B" utf8-long; prep "$B"
+UL_SIZE="$(tar -xOf "$B" ./manifest.json 2>/dev/null | wc -c | tr -d ' ')"
+check 0 "1줄 ${UL_SIZE}B 한글 매니페스트" "$(run "$B")"
+rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
+grep -q '주식회사 예시 배포팀' "$ERP_LOG" \
+  && { printf '  PASS  %-46s 앞부분 보존\n' "절단돼도 한글 앞부분 남음"; PASS=$((PASS+1)); } \
+  || { printf '  FAIL  %-46s 한글 소실\n' "절단돼도 한글 앞부분 남음"; FAIL=$((FAIL+1)); }
+if python3 -c "import io,sys; io.open(sys.argv[1],encoding='utf-8').read()" "$ERP_LOG" 2>/dev/null; then
+    printf '  PASS  %-46s 로그 전체가 유효 UTF-8\n' "절단 경계에서 UTF-8 안 깨짐"; PASS=$((PASS+1))
+else
+    printf '  FAIL  %-46s 깨진 바이트 존재\n' "절단 경계에서 UTF-8 안 깨짐"; FAIL=$((FAIL+1))
+fi
+
+printf '\n[미지 키 서명 append — 정품을 죽이면 안 된다]\n'
+make_bundle "$B"; resum "$B"
+GHOST="$WORK/ghost"; mkdir -p "$GHOST"; chmod 700 "$GHOST"
+GNUPGHOME="$GHOST" gpg --batch --passphrase '' --quick-generate-key 'Ghost <gh@example.invalid>' default default never 2>/dev/null
+GNUPGHOME="$GHOST" gpg --batch --yes --armor --detach-sign -o "$WORK/ghost.asc" "$B" 2>/dev/null
+gpgconf --homedir "$GHOST" --kill gpg-agent >/dev/null 2>&1 || true
+gpg --batch --yes --armor --detach-sign --local-user "$GOOD_FPR" -o "$WORK/g3.asc" "$B" 2>/dev/null
+printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
+cat "$WORK/g3.asc" "$WORK/ghost.asc" > "$B.asc"
+check 0 "정품 + 키링에 없는 키 서명 (뒤)" "$(run "$B")"
+cat "$WORK/ghost.asc" "$WORK/g3.asc" > "$B.asc"
+check 0 "정품 + 키링에 없는 키 서명 (앞)" "$(run "$B")"
+cp "$WORK/ghost.asc" "$B.asc"
+check 12 "미지 키 서명만 (앵커 서명 없음)" "$(run "$B")"
+prep "$B"
 
 printf '\n[앵커 게이트 — 두 환경변수가 같은 규칙을 받아야 한다]\n'
 make_bundle "$B"; prep "$B" "$BAD_FPR"

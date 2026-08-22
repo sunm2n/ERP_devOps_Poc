@@ -50,10 +50,14 @@ SCRIPT_VERSION='1.1.0'
 # 건너뛴 종료를 전부 1 로 정규화한다.
 KNOWN_EXITS=' 0 2 3 4 5 6 10 11 12 13 14 15 16 130 '
 on_signal() {   # 128+N. 수백 MB 해싱 구간에서 세션 끊김·타임아웃은 현실적인 종료 사유다
-    printf '\n  중단됨 (신호 %s)\n' "$1" >&2
-    printf '  조치: 검증이 끝나기 전에 중단되었습니다. **재운반이 아니라 재실행**이 정답입니다.\n' >&2
-    printf '        수백 MB 해싱에 시간이 걸립니다. 세션이 끊기지 않는 환경에서 다시 실행하십시오.\n' >&2
-    printf '  로그: %s\n\n' "${LOG:-<미설정>}" >&2
+    # 이 핸들러가 존재하는 이유가 '세션 끊김' 인데, 세션이 끊기면 화면이 바로 그
+    # 사라지는 매체다. 담당자에게 남는 건 로그뿐이므로 로그에도 반드시 쓴다.
+    {
+        printf '\n  중단됨 (exit 130, 신호 %s)\n' "$1"
+        printf '  조치: 검증이 끝나기 전에 중단되었습니다. **재운반이 아니라 재실행**이 정답입니다.\n'
+        printf '        수백 MB 해싱에 시간이 걸립니다. 세션이 끊기지 않는 환경에서 다시 실행하십시오.\n'
+        printf '  로그: %s\n\n' "${LOG:-<미설정>}"
+    } | { if [ -w "${LOG:-/nonexistent}" ]; then tee -a "$LOG"; else cat; fi; } >&2
     trap - EXIT
     exit 130
 }
@@ -132,7 +136,10 @@ untrusted() {
     # 제어문자만 지운다. `tr -cd '[:print:]'` 는 GNU tr 이 바이트 기반이라 로케일과
     # 무관하게 비ASCII 를 전부 삭제하고, 같은 번들의 한글 서명자가 Linux 에서만
     # 사라진다 — OS 마다 다른 기록이 남는다.
-    tr -d '\000-\010\013\014\016-\037\177' | awk -v max=2048 '
+    # LC_ALL=C 로 고정한다. awk 의 length()/substr() 는 gawk + UTF-8 로케일에서
+    # '문자' 단위라, 같은 한글 1줄이 환경에 따라 2048B 로도 6144B 로도 잘린다.
+    # 종료 코드에서 없앤 'OS 마다 다른 결과' 가 절단 경계로 자리를 옮기는 것을 막는다.
+    tr -d '\000-\010\013\014\016-\037\177' | LC_ALL=C awk -v max=2048 '
         BEGIN { n = 0; cut = 0; dropped = 0 }
         {
             if (n >= max) { dropped++; next }
@@ -141,7 +148,11 @@ untrusted() {
             else {
                 # 줄을 버리지 않는다. 매니페스트는 흔히 1줄(compact JSON)이라
                 # 버리면 version·commit·digest 가 통째로 사라진다.
-                print "      | " substr($0, 1, room) "…"
+                s = substr($0, 1, room)
+                # 바이트 절단이 UTF-8 시퀀스를 중간에서 자르면 로그가 깨진 바이트로
+                # 끝나고, 엄격한 UTF-8 소비자(로그 수집기 등)가 그 줄에서 실패한다.
+                sub(/[\200-\277]*$/, "", s); sub(/[\302-\364]$/, "", s)
+                print "      | " s "…"
                 n = max; cut = 1
             }
         }
@@ -255,6 +266,10 @@ if [ -e "$FPR_FILE" ]; then
     fi
 elif [ "$FPR_OVERRIDE" = 'unsafe' ] && [ -n "${ERP_EXPECTED_FPR:-}" ]; then
     EXPECTED_FPR="$(printf '%s' "$ERP_EXPECTED_FPR" | normalize_fpr)"
+    # 파일 쪽과 같은 규칙이다. 공백만 든 값이 '미지정' 으로 강등되면 로그만 봐서는
+    # 지문 대조를 아예 안 한 것과 구분이 안 된다.
+    [ -n "$EXPECTED_FPR" ] || die 5 "ERP_EXPECTED_FPR 에 지문 값이 없습니다" \
+        "공백·개행만 들어 있습니다. 값이 치환되지 않았을 수 있습니다. 확인 후 다시 실행하십시오."
     FPR_SOURCE="환경변수 ERP_EXPECTED_FPR (앵커 우회 모드)"
 fi
 
@@ -268,9 +283,37 @@ printf '%s\n' "$VERIFY_OUT" >> "$LOG"
 
 status() { printf '%s\n' "$VERIFY_OUT" | grep -q "^\[GNUPG:\] $1"; }
 
+# 앵커와 일치하는 유효 서명이 있으면 미지 키 서명은 경고로 강등한다.
+# .asc 는 서명되지 않은 컨테이너라, 키링에 없는 아무 키로 만든 블록 하나를 붙이는
+# 것만으로 모든 정품 번들이 exit 12 로 죽고 — 그 조치문이 운영자를 앵커 재배포
+# 경로(가장 비싼 지원 경로)로 보낸다. 만료·폐기와 같은 처리다.
+# 서명 목록을 먼저 뽑는다. 아래 NO_PUBKEY·만료·폐기 판정이 전부 '앵커에 해당하는
+# 서명이 있는가' 를 기준으로 하므로, 그 판정보다 앞에 있어야 한다.
+# VALIDSIG 의 3번째 필드는 '서명에 쓰인 키' 지문, 마지막 필드는 primary 지문이다.
+ALL_SIGNING="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $3}')"
+ALL_PRIMARY="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $NF}')"
+BAD_IDS="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG)/{print $3}')"
+# grep 을 끼우지 않는다. 빈 입력에서 grep 이 1 을 반환하면 pipefail 이 스크립트를 죽인다.
+SIG_COUNT="$(printf '%s\n' "$ALL_SIGNING" | awk -v b="$BAD_IDS" '
+    BEGIN { n = split(b, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") bad[a[i]] = 1 }
+    NF && !(substr($0, length($0) - 15) in bad) { c++ }
+    END { print c + 0 }')"
+SIGNING_FPR="$(printf '%s\n' "$ALL_SIGNING" | head -1)"
+PRIMARY_FPR="$(printf '%s\n' "$ALL_PRIMARY" | head -1)"
+ACTUAL_FPR="${PRIMARY_FPR:-$SIGNING_FPR}"
+
+ANCHOR_SIGNED=''
+if [ -n "$EXPECTED_FPR" ] &&
+   printf '%s\n%s\n' "$ALL_PRIMARY" "$ALL_SIGNING" | grep -qxF "$EXPECTED_FPR"; then
+    ANCHOR_SIGNED='yes'
+fi
 if status NO_PUBKEY; then
-    die 12 "이 번들에 서명한 키가 키링에 없습니다" \
-        "다른 키로 서명되었거나 신뢰 앵커가 갱신되지 않았습니다. 번들 안의 키를 임포트하지 마십시오. 공급사에 확인하십시오."
+    if [ -n "$ANCHOR_SIGNED" ]; then
+        say "      경고: 키링에 없는 키의 서명이 .asc 에 포함되어 있습니다 (판정에는 쓰지 않습니다)"
+    else
+        die 12 "이 번들에 서명한 키가 키링에 없습니다" \
+            "다른 키로 서명되었거나 신뢰 앵커가 갱신되지 않았습니다. 번들 안의 키를 임포트하지 마십시오. 공급사에 확인하십시오."
+    fi
 fi
 
 # EXPKEYSIG/REVKEYSIG 만 본다. 맨 KEYEXPIRED/KEYREVOKED 는 **이 서명과 무관한**
@@ -316,20 +359,6 @@ else
     fi
 fi
 
-# VALIDSIG 의 3번째 필드는 '서명에 쓰인 키' 지문, 마지막 필드는 primary 키 지문이다.
-# 전용 서명 서브키를 쓰면 둘이 다르고, 운영자가 등록하는 값은 primary 다
-# (`gpg --fingerprint` 가 보여주는 것). primary 로 대조하지 않으면 정상 번들이 거짓 거부된다.
-ALL_SIGNING="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $3}')"
-ALL_PRIMARY="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $NF}')"
-BAD_IDS="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG)/{print $3}')"
-# grep 을 끼우지 않는다. 빈 입력에서 grep 이 1 을 반환하면 pipefail 이 스크립트를 죽인다.
-SIG_COUNT="$(printf '%s\n' "$ALL_SIGNING" | awk -v b="$BAD_IDS" '
-    BEGIN { n = split(b, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") bad[a[i]] = 1 }
-    NF && !(substr($0, length($0) - 15) in bad) { c++ }
-    END { print c + 0 }')"
-SIGNING_FPR="$(printf '%s\n' "$ALL_SIGNING" | head -1)"
-PRIMARY_FPR="$(printf '%s\n' "$ALL_PRIMARY" | head -1)"
-ACTUAL_FPR="${PRIMARY_FPR:-$SIGNING_FPR}"
 
 if ! status GOODSIG; then
     say "기대 서명자: ${EXPECTED_FPR:-<미지정>}"
@@ -395,7 +424,10 @@ MANIFEST_VDIRS="$(printf '%s\n' "$MANIFEST_DIRS" | grep -v '^\.$' || true)"
 
 MISSING_INSTALL="$(comm -13 <(printf '%s\n' "$VERSION_DIRS") <(printf '%s\n' "$MANIFEST_VDIRS") || true)"
 # 최상위 묶음 매니페스트가 있으면 레이아웃 A 다. 버전별 매니페스트 부재는 결함이 아니다.
-if printf '%s\n' "$MANIFEST_DIRS" | grep -qx '\.'; then
+# 최상위 매니페스트가 있고 **버전별 매니페스트가 하나도 없을 때만** 레이아웃 A 로 본다.
+# 무조건 억제하면 레이아웃 B 에서 일부 버전 매니페스트가 빠진 것을 조용히 덮는다.
+if printf '%s\n' "$MANIFEST_DIRS" | grep -qx '\.' &&
+   [ -z "$(printf '%s' "$MANIFEST_VDIRS" | tr -d '[:space:]')" ]; then
     MISSING_MANIFEST=''
 else
     MISSING_MANIFEST="$(comm -23 <(printf '%s\n' "$VERSION_DIRS") <(printf '%s\n' "$MANIFEST_VDIRS") || true)"
