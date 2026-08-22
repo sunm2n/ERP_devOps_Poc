@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- 번들 크기가 plan.md 5장 핵심 지표다. 불필요한 것을 처음부터 넣지 않는다. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- HealthChecks 는 .NET 10 공유 프레임워크에 포함되어 있다. 명시 참조하면
+         NU1510 (pruning 불가)로 빌드가 깨진다. -->
+    <PackageReference Include="Npgsql" Version="9.0.3" />
+  </ItemGroup>
+
+</Project>
