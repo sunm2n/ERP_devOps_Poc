@@ -281,7 +281,15 @@ PUBKEY_COUNT="$(gpg --list-keys --with-colons 2>/dev/null | grep -c '^pub' || tr
 VERIFY_OUT="$(gpg --status-fd 1 --verify "$SIGFILE" "$BUNDLE" 2>>"$LOG" || true)"
 printf '%s\n' "$VERIFY_OUT" >> "$LOG"
 
-status() { printf '%s\n' "$VERIFY_OUT" | grep -q "^\[GNUPG:\] $1"; }
+# 판정 분기에는 파이프를 쓰지 않는다. `printf | grep -q` 는 grep 이 첫 매치에서
+# 즉시 종료하면서 printf 를 SIGPIPE 로 죽이고, pipefail 이 그 141 을 그대로 올려
+# **"찾았는데 못 찾았다"** 고 보고한다. gpg 출력이 파이프 버퍼(64KB)를 넘으면 터지고,
+# 공격자는 .asc 에 서명 블록을 수백 개 붙이는 것만으로 그 크기를 만들 수 있다.
+# 셸 내장 패턴 매칭은 서브프로세스·로케일·SIGPIPE 어디에도 걸리지 않는다.
+status() { case $'\n'"$VERIFY_OUT" in *$'\n'"[GNUPG:] $1"*) return 0 ;; esac; return 1; }
+
+# 개행으로 구분된 목록에서 한 줄과 정확히 일치하는 항목을 찾는다 (grep -qxF 대체)
+has_line() { case $'\n'"$1"$'\n' in *$'\n'"$2"$'\n'*) return 0 ;; esac; return 1; }
 
 # 앵커와 일치하는 유효 서명이 있으면 미지 키 서명은 경고로 강등한다.
 # .asc 는 서명되지 않은 컨테이너라, 키링에 없는 아무 키로 만든 블록 하나를 붙이는
@@ -292,19 +300,21 @@ status() { printf '%s\n' "$VERIFY_OUT" | grep -q "^\[GNUPG:\] $1"; }
 # VALIDSIG 의 3번째 필드는 '서명에 쓰인 키' 지문, 마지막 필드는 primary 지문이다.
 ALL_SIGNING="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $3}')"
 ALL_PRIMARY="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $NF}')"
-BAD_IDS="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG)/{print $3}')"
-# grep 을 끼우지 않는다. 빈 입력에서 grep 이 1 을 반환하면 pipefail 이 스크립트를 죽인다.
-SIG_COUNT="$(printf '%s\n' "$ALL_SIGNING" | awk -v b="$BAD_IDS" '
-    BEGIN { n = split(b, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") bad[a[i]] = 1 }
-    NF && !(substr($0, length($0) - 15) in bad) { c++ }
-    END { print c + 0 }')"
+# 여러 줄 값을 `awk -v` 로 넘기지 않는다. BSD awk 는 값에 개행이 있으면
+# `newline in string` 으로 죽는다 — 서명 블록이 수백 개면 실제로 터진다.
+# grep 도 끼우지 않는다. 빈 입력에서 1 을 반환하면 pipefail 이 스크립트를 죽인다.
+# VERIFY_OUT 을 한 번만 읽어 둘 다 피한다.
+SIG_COUNT="$(printf '%s\n' "$VERIFY_OUT" | awk '
+    /^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG)/ { bad[$3] = 1 }
+    /^\[GNUPG:\] VALIDSIG/              { sig[$3] = 1 }
+    END { c = 0; for (s in sig) if (!(substr(s, length(s) - 15) in bad)) c++; print c }')"
 SIGNING_FPR="$(printf '%s\n' "$ALL_SIGNING" | head -1)"
 PRIMARY_FPR="$(printf '%s\n' "$ALL_PRIMARY" | head -1)"
 ACTUAL_FPR="${PRIMARY_FPR:-$SIGNING_FPR}"
 
 ANCHOR_SIGNED=''
 if [ -n "$EXPECTED_FPR" ] &&
-   printf '%s\n%s\n' "$ALL_PRIMARY" "$ALL_SIGNING" | grep -qxF "$EXPECTED_FPR"; then
+   { has_line "$ALL_PRIMARY" "$EXPECTED_FPR" || has_line "$ALL_SIGNING" "$EXPECTED_FPR"; }; then
     ANCHOR_SIGNED='yes'
 fi
 if status NO_PUBKEY; then
@@ -383,7 +393,7 @@ if [ -n "$EXPECTED_FPR" ]; then
     # 서명 중 **하나라도** 앵커와 맞으면 통과한다. 첫 번째만 보면 공격자가 번들을
     # 건드리지 않고 자기 서명을 앞에 덧붙이는 것만으로 거짓 exit 14 를 반복 생성할 수
     # 있고, exit 14 는 '즉시 연락' 경로다 — 거짓 경보가 반복되면 그 경로가 안 믿긴다.
-    if ! printf '%s\n%s\n' "$ALL_PRIMARY" "$ALL_SIGNING" | grep -qxF "$EXPECTED_FPR"; then
+    if ! has_line "$ALL_PRIMARY" "$EXPECTED_FPR" && ! has_line "$ALL_SIGNING" "$EXPECTED_FPR"; then
         die 14 "서명자가 기대 지문과 다릅니다 (서명 불일치)" \
             "유효한 서명이지만 등록된 공급사 키가 아닙니다. 설치하지 말고 공급사에 연락하십시오."
     fi
@@ -426,7 +436,7 @@ MISSING_INSTALL="$(comm -13 <(printf '%s\n' "$VERSION_DIRS") <(printf '%s\n' "$M
 # 최상위 묶음 매니페스트가 있으면 레이아웃 A 다. 버전별 매니페스트 부재는 결함이 아니다.
 # 최상위 매니페스트가 있고 **버전별 매니페스트가 하나도 없을 때만** 레이아웃 A 로 본다.
 # 무조건 억제하면 레이아웃 B 에서 일부 버전 매니페스트가 빠진 것을 조용히 덮는다.
-if printf '%s\n' "$MANIFEST_DIRS" | grep -qx '\.' &&
+if has_line "$MANIFEST_DIRS" '.' &&
    [ -z "$(printf '%s' "$MANIFEST_VDIRS" | tr -d '[:space:]')" ]; then
     MISSING_MANIFEST=''
 else

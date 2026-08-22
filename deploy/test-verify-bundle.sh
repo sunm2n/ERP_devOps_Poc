@@ -243,7 +243,9 @@ rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
 grep -q '주식회사 예시 배포팀' "$ERP_LOG" \
   && { printf '  PASS  %-46s 앞부분 보존\n' "절단돼도 한글 앞부분 남음"; PASS=$((PASS+1)); } \
   || { printf '  FAIL  %-46s 한글 소실\n' "절단돼도 한글 앞부분 남음"; FAIL=$((FAIL+1)); }
-if python3 -c "import io,sys; io.open(sys.argv[1],encoding='utf-8').read()" "$ERP_LOG" 2>/dev/null; then
+if ! command -v python3 >/dev/null 2>&1; then
+    skip "절단 경계에서 UTF-8 안 깨짐" "python3 없음 — 판정 도구 부재를 회귀로 세지 않는다"
+elif python3 -c "import io,sys; io.open(sys.argv[1],encoding='utf-8').read()" "$ERP_LOG" 2>/dev/null; then
     printf '  PASS  %-46s 로그 전체가 유효 UTF-8\n' "절단 경계에서 UTF-8 안 깨짐"; PASS=$((PASS+1))
 else
     printf '  FAIL  %-46s 깨진 바이트 존재\n' "절단 경계에서 UTF-8 안 깨짐"; FAIL=$((FAIL+1))
@@ -263,6 +265,12 @@ cat "$WORK/ghost.asc" "$WORK/g3.asc" > "$B.asc"
 check 0 "정품 + 키링에 없는 키 서명 (앞)" "$(run "$B")"
 cp "$WORK/ghost.asc" "$B.asc"
 check 12 "미지 키 서명만 (앵커 서명 없음)" "$(run "$B")"
+
+# gpg status 출력을 파이프 버퍼(64KB) 너머로 부풀린다. 판정 분기가 파이프를 쓰면
+# grep -q 의 SIGPIPE 가 pipefail 을 타고 올라와 '찾았는데 못 찾았다' 가 된다.
+{ cat "$WORK/g3.asc"; i=0; while [ "$i" -lt 900 ]; do cat "$WORK/ghost.asc"; i=$((i+1)); done; } > "$B.asc"
+ASC_KB="$(( $(wc -c < "$B.asc") / 1024 ))"
+check 0 "정품 + 미지 키 서명 900개 (.asc ${ASC_KB}KB)" "$(run "$B")"
 prep "$B"
 
 printf '\n[앵커 게이트 — 두 환경변수가 같은 규칙을 받아야 한다]\n'
@@ -290,6 +298,12 @@ printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
 check 0 "정품 + 폐기키 서명 병존 (앵커는 정상)" "$(run "$B")"
 printf '%s\n' "$R2" > "$ERP_FPR_FILE"
 check 16 "앵커가 폐기된 키일 때" "$(run "$B")"
+# 앵커 미지정에서도 종료 코드가 흔들리면 안 된다 (16 이 11 로 바뀌던 자리).
+# gpg status 를 파이프 버퍼 너머로 부풀린 상태에서 확인한다. 패딩은 **폐기 키 자신의**
+# 서명으로 한다 — ghost 로 채우면 NO_PUBKEY 가 먼저 발동해 폐기 경로를 못 본다.
+{ i=0; while [ "$i" -lt 900 ]; do cat "$WORK/r2.asc"; i=$((i+1)); done; } > "$B.asc"
+check 16 "앵커 미지정 + 폐기 서명 + 900개 패딩" \
+  "$(unset ERP_FPR_FILE ERP_ALLOW_UNSAFE_ANCHOR; run "$B")"
 printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
 prep "$B"
 
