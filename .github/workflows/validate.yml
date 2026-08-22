@@ -72,4 +72,14 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - if: steps.check.outputs.exists == 'true'
-        run: dotnet build src --configuration Release
+        # 솔루션이 있으면 그것을, 없으면 찾은 프로젝트를 각각 빌드한다.
+        # `dotnet build <디렉터리>` 는 그 디렉터리에 프로젝트/솔루션이 **직접** 있을 때만
+        # 동작한다 — src/ErpCore/ErpCore.csproj 만 있던 시점에 이 스텝이 MSB1003 으로 깨졌다.
+        run: |
+          sln="$(find src -maxdepth 2 -name '*.sln' -o -maxdepth 2 -name '*.slnx' | head -1)"
+          if [ -n "$sln" ]; then
+            echo "solution: $sln"
+            dotnet build "$sln" --configuration Release
+          else
+            find src -name '*.csproj' -print0 | xargs -0 -n1 dotnet build --configuration Release
+          fi
