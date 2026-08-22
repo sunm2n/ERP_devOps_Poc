@@ -72,14 +72,35 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - if: steps.check.outputs.exists == 'true'
-        # 솔루션이 있으면 그것을, 없으면 찾은 프로젝트를 각각 빌드한다.
         # `dotnet build <디렉터리>` 는 그 디렉터리에 프로젝트/솔루션이 **직접** 있을 때만
         # 동작한다 — src/ErpCore/ErpCore.csproj 만 있던 시점에 이 스텝이 MSB1003 으로 깨졌다.
         run: |
-          sln="$(find src -maxdepth 2 -name '*.sln' -o -maxdepth 2 -name '*.slnx' | head -1)"
-          if [ -n "$sln" ]; then
-            echo "solution: $sln"
-            dotnet build "$sln" --configuration Release
-          else
-            find src -name '*.csproj' -print0 | xargs -0 -n1 dotnet build --configuration Release
+          set -euo pipefail
+          sln="$(find src -maxdepth 2 \( -name '*.sln' -o -name '*.slnx' \) | sort | head -1)"
+
+          if [ -z "$sln" ]; then
+            find src -name '*.csproj' -print0 | sort -z \
+              | xargs -0 -n1 dotnet restore --locked-mode
+            find src -name '*.csproj' -print0 | sort -z \
+              | xargs -0 -n1 dotnet build --configuration Release --no-restore
+            exit 0
           fi
+
+          echo "solution: $sln"
+
+          # 솔루션에 등록되지 않은 프로젝트는 **컴파일조차 되지 않은 채 초록불**이 된다.
+          # 다음 이슈(#9)가 테스트 프로젝트를 추가하며 등록을 잊으면 그대로 새는 자리다.
+          found="$(find src -name '*.csproj' | wc -l | tr -d ' ')"
+          listed="$(grep -c 'Path=' "$sln" || true)"
+          if [ "$found" != "$listed" ]; then
+            echo "::error::src 아래 csproj $found 개 중 솔루션에 등록된 것은 $listed 개입니다."
+            echo "::error::등록되지 않은 프로젝트는 빌드되지 않은 채 CI 가 통과합니다."
+            find src -name '*.csproj' | sed 's/^/  found: /'
+            grep 'Path=' "$sln" | sed 's/^/  listed:/'
+            exit 1
+          fi
+
+          # 잠금 파일과 어긋나면 실패시킨다. 같은 커밋이 다른 의존성으로 복원되면
+          # plan.md 1단계의 "같은 커밋 -> 같은 이미지" 근거가 사라진다.
+          dotnet restore "$sln" --locked-mode
+          dotnet build "$sln" --configuration Release --no-restore
