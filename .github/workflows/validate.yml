@@ -70,6 +70,76 @@ jobs:
       - uses: actions/setup-dotnet@v4
         if: steps.check.outputs.exists == 'true'
         with:
-          dotnet-version: '10.0.x'
+          # SDK 핀은 한 곳이어야 한다. `dotnet-version: '10.0.x'` 는 그때그때 최신 패치를
+          # 깔고 global.json 은 rollForward:disable 로 정확 일치를 요구하므로, MS 가 다음
+          # 패치를 내는 날 **커밋 없이** 모든 PR 이 RC=155 로 죽는다.
+          global-json-file: global.json
       - if: steps.check.outputs.exists == 'true'
-        run: dotnet build src --configuration Release
+        # `dotnet build <디렉터리>` 는 그 디렉터리에 프로젝트/솔루션이 **직접** 있을 때만
+        # 동작한다 — src/ErpCore/ErpCore.csproj 만 있던 시점에 이 스텝이 MSB1003 으로 깨졌다.
+        run: |
+          set -euo pipefail
+          TMP="$(mktemp -d)"
+
+          # **잠금 파일 검사는 두 분기 공통이다.** 잠금 모드 복원은 잠금 파일이 없으면
+          # 실패하지 않고 **조용히 만들어 준다**(실측) — 재현성은 이 검사가 만든다.
+          find src -name '*.csproj' | sort -u > "$TMP/all.txt"
+          missing=0
+          while IFS= read -r proj; do
+            [ -f "$(dirname "$proj")/packages.lock.json" ] || {
+              echo "::error::잠금 파일 없음: $proj"
+              echo "::error::  복구: dotnet restore '$proj' 후 packages.lock.json 을 커밋하십시오."
+              echo "::error::  (정확히 global.json 의 SDK 가 필요합니다 — 없으면 sdk:10.0 컨테이너로)"
+              missing=1
+            }
+          done < "$TMP/all.txt"
+          [ "$missing" -eq 0 ] || exit 1
+
+          sln="$(find src -maxdepth 2 \( -name '*.sln' -o -name '*.slnx' \) | sort | head -1)"
+
+          if [ -z "$sln" ]; then
+            find src -name '*.csproj' -print0 | sort -z \
+              | xargs -0 -n1 dotnet restore --locked-mode
+            find src -name '*.csproj' -print0 | sort -z \
+              | xargs -0 -n1 dotnet build --configuration Release --no-restore
+            exit 0
+          fi
+
+          echo "solution: $sln"
+
+          # 솔루션에 등록되지 않은 프로젝트는 **컴파일조차 되지 않은 채 초록불**이 된다.
+          # 개수만 대조하면 안 된다 — .slnx 의 <Folder Path=>·<File Path=> 까지 세므로
+          # 솔루션 폴더 2줄이 미등록 프로젝트 2개를 정확히 상쇄해 **미탐**한다(실측).
+          # `dotnet sln list` 로 등록 목록을 뽑아 경로 집합으로 비교하면 포맷 파싱이
+          # 사라지고 고전 .sln 도 함께 커버된다.
+          # `|| true` 로 삼키지 않는다. 솔루션 파일이 깨졌을 때 그것을 커버리지 불일치로
+          # 보고하면 진단이 엉뚱한 곳을 가리킨다 (실측: 잘못된 Folder 문법 -> sln list 가
+          # rc=1 + 사유를 내는데, 삼키면 '등록 0개' 로만 보인다).
+          if ! sln_out="$(dotnet sln "$sln" list 2>&1)"; then
+            echo "::error::솔루션 파일을 읽을 수 없습니다: $sln"
+            printf '%s\n' "$sln_out"
+            exit 1
+          fi
+          # `dotnet sln list` 가 내는 경로는 **솔루션 디렉터리 기준 상대경로**다.
+          # 접두사를 'src/' 로 하드코딩하면 깊이 2 솔루션에서 정상 등록을 '미등록' 으로
+          # 보고한다 (실측: src/App/App.slnx + src/App/Lib/Lib.csproj).
+          slndir="$(dirname "$sln")"
+          # grep 이 0건이면 pipefail 이 무진단으로 죽인다 — '솔루션은 만들었는데 아직
+          # add 안 한' 상태가 바로 이 검사가 발화해야 하는 입력이다. `|| :` 로 받는다.
+          printf '%s\n' "$sln_out" \
+            | { grep -E '\.csproj$' || :; } \
+            | tr '\\' '/' \
+            | sed "s#^#$slndir/#" \
+            | sort -u > "$TMP/listed.txt"
+          if ! diff -u "$TMP/listed.txt" "$TMP/all.txt" > "$TMP/cov.diff"; then
+            echo "::error::솔루션 등록 목록과 src 아래 실제 프로젝트가 다릅니다."
+            echo "::error::등록되지 않은 프로젝트는 빌드되지 않은 채 CI 가 통과합니다."
+            echo '--- 솔루션 등록 (-) vs 실제 발견 (+) ---'
+            cat "$TMP/cov.diff"
+            exit 1
+          fi
+
+          # 잠금 파일과 어긋나면 실패시킨다. 같은 커밋이 다른 의존성으로 복원되면
+          # plan.md 1단계의 "같은 커밋 -> 같은 이미지" 근거가 사라진다.
+          dotnet restore "$sln" --locked-mode
+          dotnet build "$sln" --configuration Release --no-restore

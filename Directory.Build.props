@@ -1,0 +1,24 @@
+<Project>
+
+  <!--
+    저장소 전체에 적용되는 빌드 규약. **프로젝트별 csproj 에 두면 새 프로젝트가 빠뜨린다** —
+    #9(테스트)·#23(커스텀 확장)이 추가될 때 재현성·공급망 통제가 그 프로젝트에만 없는
+    상태가 조용히 만들어진다. 실측으로 확인된 구멍이라 루트로 올린다.
+  -->
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+
+    <!-- NU1900 은 'NuGetAudit 이 취약점 DB 에 못 닿음' 이다. 에러로 두면 폐쇄망 빌드(H8)가
+         패키지 캐시가 완전히 따뜻해도 실패한다. 그때 가장 빠른 손이 TreatWarningsAsErrors 를
+         끄는 것이고, 그러면 NU1901~1904(실제 알려진 취약점)까지 함께 침묵한다.
+         감사 '실패' 만 떼고 감사 '결과' 는 에러로 남긴다. -->
+    <WarningsNotAsErrors>NU1900;NU1905</WarningsNotAsErrors>
+
+    <!-- 같은 커밋이 같은 의존성으로 복원되어야 한다 (plan.md 1단계, H1 재현성).
+         이 속성이 없는 프로젝트는 잠금 모드 복원을 **조용히 통과**한다. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+</Project>
