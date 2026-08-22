@@ -40,9 +40,15 @@ public sealed class DatabaseHealthCheck : IHealthCheck
 
             // Npgsql 에서 Timeout=0 은 **무한대**다. `builder.Timeout > connectTimeout` 만
             // 보면 0 이 통과해(0 > 2 는 거짓) 막으려던 붕괴가 그대로 일어난다.
-            _connectTimeoutSeconds = Math.Max(1, (int)Math.Floor(timeout.TotalSeconds) - 1);
-            if (builder.Timeout == 0 || builder.Timeout > _connectTimeoutSeconds)
-                builder.Timeout = _connectTimeoutSeconds;
+            var clamp = Math.Max(1, (int)Math.Floor(timeout.TotalSeconds) - 1);
+            if (builder.Timeout == 0 || builder.Timeout > clamp)
+                builder.Timeout = clamp;
+
+            // **실효값을 담는다.** 클램프 값을 찍으면, 고객사 연결 문자열의 Timeout 이 더
+            // 작을 때(실운영의 다수) "4초 만에 포기하고 after 59s" 라고 보고한다 —
+            // 같은 응답의 durationMs 가 그것을 정면으로 반박하고, 전화로 읽는 쪽은
+            // 한글이 붙은 N 이다. 망 담당자는 그 N 으로 조사 범위를 잡는다.
+            _connectTimeoutSeconds = builder.Timeout;
 
             _connectionString = builder.ConnectionString;
             _endpoint = $"{builder.Host}:{builder.Port}/{builder.Database}";

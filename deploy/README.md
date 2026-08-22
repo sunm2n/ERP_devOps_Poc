@@ -15,7 +15,8 @@
 | `expected-fingerprint` | 서명자 판정 기준 | **exit 0 으로 통과하되 키링의 아무 키로나 통과한다** |
 | 종료 코드 표 (아래) | 고객사 담당자용 1장 | 전화 통화가 3분에서 30분이 된다 |
 
-`test-verify-bundle.sh` 는 고객사에 가지 않는다. 개발 측 산출물이다.
+`wait-for-health.sh` 는 설치 스크립트(#20)가 호출하는 **적용 완료 판정**이다 — 고객사에 간다.
+`test-*.sh` 두 개는 개발 측 산출물이라 고객사에 가지 않는다.
 
 ## 왜 번들 밖이어야 하는가
 
@@ -151,36 +152,22 @@ exit 14("즉시 연락")를 반복 생성할 수 있다 — 거짓 경보가 반
 **21·22 를 나눈 이유**: 21 은 재적용으로 고쳐질 수 있고 22 는 절대 안 고쳐진다.
 같은 코드로 묶으면 담당자가 고쳐지지 않을 것을 반복한다.
 
+`deploy/wait-for-health.sh` 가 이 계약의 **정본**이다. 문서 코드블록에 두면 shellcheck 도
+테스트도 닿지 않는다 — 실제로 그 상태에서 조용히 틀리는 경로가 둘 있었다(빈 SHA 가
+무엇에나 일치해 통과, `code=000` 일 때 직전 폴링의 낡은 본문 출력).
+`verify-bundle.sh` 와 같은 규율로 파일에 두고 `test-wait-for-health.sh` 로 실패 경로를 전수 검증한다.
+
 ```sh
-# 503 에서 종료하지 않는다 — 첫 폴링은 거의 항상 503 이다.
-LOG=/var/log/erp-install-health.json
-EXPECTED_SHA="$(sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p' manifest.json)"
-command -v curl >/dev/null || { echo "curl 이 없습니다"; exit 23; }
+wait-for-health.sh <헬스URL> [기대커밋SHA] [최대대기초]
 
-deadline=$(( $(date +%s) + 600 ))
-last=''
-while :; do
-  # curl 이 실패하면 -w 가 이미 000 을 찍는다. `|| echo 000` 을 붙이면 000000 이 된다.
-  code="$(curl -s -o "$LOG" -w '%{http_code}' http://127.0.0.1:8080/health)" || code=000
-  [ "$code" = 200 ] && break
-  [ "$code" = "$last" ] || { echo "[$code] 대기 중:"; cat "$LOG" 2>/dev/null; echo; last="$code"; }
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "대기 상한 600초 초과 (마지막 응답 코드 $code)"; cat "$LOG" 2>/dev/null
-    [ "$code" = 000 ] && exit 23 || exit 20
-  fi
-  sleep 2
-done
-
-# 인코더가 relaxed 라 `+` 와 한글이 원문으로 나온다 — jq 없이 셸만으로 뽑힌다.
-grep -q '"buildIdentity":"missing-commit-sha"' "$LOG" && {
-  echo "빌드 신원 없음 — build 대조가 무의미합니다"; exit 22; }
-actual="$(sed -n 's/.*"build":"[^+]*+\([0-9a-f]*\)".*/\1/p' "$LOG")"
-case "$EXPECTED_SHA" in
-  "$actual"*) : ;;   # 앞자리 일치
-  *) echo "build 불일치: 기대 $EXPECTED_SHA / 실제 $actual"; exit 21 ;;
-esac
-echo "적용 완료"
+# #20 에서:
+wait-for-health.sh http://127.0.0.1:8080/health "$(sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p' manifest.json)" 600
 ```
+
+| 환경변수 | 기본값 |
+| --- | --- |
+| `ERP_HEALTH_LOG` | `/var/log/erp-install-health.json` |
+| `ERP_POLL_INTERVAL` | `2` |
 
 **`127.0.0.1:8080` 에 닿으려면 컨테이너 포트 매핑(`-p 8080:8080`)이 필요하다.**
 그 결정은 #12 소관이고, 누락되면 응답 코드가 `000` 으로 나온다 (종료 코드 23).
