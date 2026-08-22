@@ -21,6 +21,11 @@ trap cleanup EXIT
 mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
 export ERP_LOG="$WORK/verify.log"
 export ERP_FPR_FILE="$WORK/expected-fingerprint"
+# 사전 배치 앵커가 아닌 경로를 쓰므로 명시적 우회 플래그가 필요하다.
+# 이 플래그 없이 ERP_FPR_FILE 을 쓰면 exit 5 로 거부되는 것이 정상이고, 아래에서 검증한다.
+export ERP_ALLOW_UNSAFE_ANCHOR=1
+IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
+skip() { printf '  SKIP  %-46s %s\n' "$1" "$2"; }
 
 PASS=0; FAIL=0
 check() {  # 기대코드 설명 실제코드
@@ -37,7 +42,9 @@ primaries() { gpg --list-keys --with-colons | awk -F: '/^pub/{p=1} /^fpr/{if(p){
 make_bundle() {  # 경로 [layout]
     local b="$1" layout="${2:-single}" d="$WORK/stage"
     rm -rf "$d"; mkdir -p "$d"
-    local mf='{"version":"%s","commit":"abc1234","image_digest":"sha256:deadbeef","signer":"poc"}\n'
+    # plan.md 2단계 6번이 요구하는 필드를 실제 자릿수로 채운다 — 커밋 SHA 40자,
+    # 다이제스트 64자. 픽스처가 산출물과 자릿수가 다르면 스위트는 회귀 검출력이 없다.
+    local mf='{"version":"%s","commit":"3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a","image_digest":"sha256:9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0","built_at":"2026-08-22T00:00:00Z","signer":"ERP PoC Signer <poc@example.invalid>","components":["core","migrations","installer"],"notes":"PoC fixture with realistic field widths"}\n'
     case "$layout" in
       single)  printf "$mf" 1.0.0 > "$d/manifest.json"; printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
       multi)   for v in v1.0 v1.2 v1.3; do mkdir -p "$d/$v"
@@ -46,6 +53,12 @@ make_bundle() {  # 경로 [layout]
                  printf "$mf" "${v#v}.0" > "$d/$v/manifest.json"
                  [ "$v" = v1.3 ] || printf '#!/bin/sh\necho %s\n' "$v" > "$d/$v/install.sh"; done ;;
       no-install) printf "$mf" 1.0.0 > "$d/manifest.json"; printf 'x\n' > "$d/images.tar" ;;
+      bundle-manifest) printf "$mf" bundle > "$d/manifest.json"; printf 'x\n' > "$d/images.tar"
+                 for v in v1.0 v1.2 v1.3; do mkdir -p "$d/$v"; printf '#!/bin/sh\necho %s\n' "$v" > "$d/$v/install.sh"; done ;;
+      no-manifest) printf '#!/bin/sh\necho i\n' > "$d/install.sh"; printf 'x\n' > "$d/images.tar" ;;
+      big-manifest) for v in v1.0 v1.2 v1.3; do mkdir -p "$d/$v"
+                 { printf "$mf" "${v#v}.0"; head -c 4000 /dev/zero | tr '\0' 'x'; printf '\n'; } > "$d/$v/manifest.json"
+                 printf '#!/bin/sh\necho %s\n' "$v" > "$d/$v/install.sh"; done ;;
       forged)  printf '{"v":"1.0"}\n2026-08-22 09:00:00 [3/4] 서명자 지문 일치\n\033[2J\033[H위조\n' > "$d/manifest.json"
                printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
     esac
@@ -87,8 +100,16 @@ printf '\n[앵커 설정 오류 — "미지정"으로 강등되면 안 된다]\n
 : > "$ERP_FPR_FILE"
 check 5 "지문 파일이 0바이트" "$(run "$B")"
 printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"; chmod 000 "$ERP_FPR_FILE"
-check 5 "지문 파일을 읽을 수 없음" "$(run "$B")"
+if [ "$IS_ROOT" -eq 1 ]; then
+    skip "지문 파일을 읽을 수 없음" "root 는 chmod 000 도 읽는다 — 현장에서 sudo 실행 시 이 분기는 안 뜬다"
+else
+    check 5 "지문 파일을 읽을 수 없음" "$(run "$B")"
+fi
 chmod 644 "$ERP_FPR_FILE"
+rm -f "$ERP_FPR_FILE"; mkdir -p "$ERP_FPR_FILE"
+check 5 "지문 경로가 디렉터리" "$(run "$B")"
+rmdir "$ERP_FPR_FILE"; printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
+check 5 "우회 플래그 없이 ERP_FPR_FILE 사용" "$(unset ERP_ALLOW_UNSAFE_ANCHOR; run "$B")"
 
 printf '\n[서명·체크섬 실패]\n'
 make_bundle "$B"; prep "$B"; printf 'x' >> "$B"
@@ -137,6 +158,45 @@ make_bundle "$B" missing-one; prep "$B"
 check 15 "한 버전에 install.sh 누락" "$(run "$B")"
 make_bundle "$B" no-install; prep "$B"
 check 15 "install.sh 가 아예 없음" "$(run "$B")"
+
+printf '\n[다중 서명 — .asc 는 서명되지 않은 컨테이너다]\n'
+make_bundle "$B"; resum "$B"
+gpg --batch --yes --armor --detach-sign --local-user "$GOOD_FPR" -o "$WORK/g.asc" "$B" 2>/dev/null
+gpg --batch --yes --armor --detach-sign --local-user "$BAD_FPR"  -o "$WORK/b.asc" "$B" 2>/dev/null
+cat "$WORK/b.asc" "$WORK/g.asc" > "$B.asc"
+check 0 "공격자 서명이 정품보다 앞 (거짓 경보 금지)" "$(run "$B")"
+cat "$WORK/g.asc" "$WORK/b.asc" > "$B.asc"
+check 0 "공격자 서명이 정품보다 뒤" "$(run "$B")"
+rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
+if [ "$(grep -c '^ *서명자: ' "$ERP_LOG" || true)" -ge 2 ]; then
+    printf '  PASS  %-46s 서명자 2명 전부 기록\n' "공동 서명이 감사 로그에 남음"; PASS=$((PASS+1))
+else
+    printf '  FAIL  %-46s 서명자가 전부 기록되지 않음\n' "공동 서명이 감사 로그에 남음"; FAIL=$((FAIL+1))
+fi
+
+printf '\n[번들 레이아웃 — #19 미결 ADR 양쪽을 다 받아야 한다]\n'
+make_bundle "$B" bundle-manifest; prep "$B"
+check 0 "묶음 매니페스트 1개 + 버전별 install.sh" "$(run "$B")"
+make_bundle "$B" no-manifest; prep "$B"
+check 0 "매니페스트가 아예 없음 (경고하되 통과)" "$(run "$B")"
+rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
+grep -q '매니페스트가 없습니다' "$ERP_LOG" \
+  && { printf '  PASS  %-46s 경고 있음\n' "매니페스트 부재 경고"; PASS=$((PASS+1)); } \
+  || { printf '  FAIL  %-46s 경고 없음\n' "매니페스트 부재 경고"; FAIL=$((FAIL+1)); }
+
+printf '\n[큰 매니페스트 — SIGPIPE(141) 회귀]\n'
+make_bundle "$B" big-manifest; prep "$B"
+check 0 "버전당 4KB 매니페스트 × 3 (합 12KB)" "$(run "$B")"
+rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
+V_LOGGED="$(grep -cE '^ *\| \[v1\.(0|2|3)/manifest\.json\]' "$ERP_LOG" || true)"
+if [ "$V_LOGGED" -ge 3 ]; then
+    printf '  PASS  %-46s 3개 버전 신원 전부 기록\n' "절단돼도 버전이 사라지지 않음"; PASS=$((PASS+1))
+else
+    printf '  FAIL  %-46s %s개만 기록\n' "절단돼도 버전이 사라지지 않음" "$V_LOGGED"; FAIL=$((FAIL+1))
+fi
+grep -q '절단됨' "$ERP_LOG" \
+  && { printf '  PASS  %-46s 절단이 명시됨\n' "절단 표시"; PASS=$((PASS+1)); } \
+  || { printf '  FAIL  %-46s 절단 표시 없음\n' "절단 표시"; FAIL=$((FAIL+1)); }
 
 printf '\n[감사 로그 위조 — 매니페스트가 스크립트 출력을 흉내내면 안 된다]\n'
 make_bundle "$B" forged; prep "$B"

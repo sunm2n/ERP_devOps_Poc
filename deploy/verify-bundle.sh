@@ -43,9 +43,37 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-SCRIPT_VERSION='1.0.0'
+SCRIPT_VERSION='1.1.0'
 
-FPR_FILE="${ERP_FPR_FILE:-/etc/erp-deploy/expected-fingerprint}"
+# 종료 코드는 닫힌 집합이어야 한다. README 표가 자동화의 인터페이스이고, 폐쇄망에서
+# 표에 없는 코드는 담당자에게 '원인 불명' 과 같다. errexit 나 SIGPIPE 로 die() 를
+# 건너뛴 종료를 전부 1 로 정규화한다.
+KNOWN_EXITS=' 0 2 3 4 5 6 10 11 12 13 14 15 16 '
+on_exit() {
+    local c=$?
+    case "$KNOWN_EXITS" in
+        *" $c "*) exit "$c" ;;
+    esac
+    printf '\n  내부 오류 (exit 1, 원래 코드 %s)\n' "$c" >&2
+    printf '  조치: 재운반으로 해결되지 않습니다. 로그 전문과 함께 공급사에 문의하십시오.\n' >&2
+    printf '  로그: %s\n\n' "${LOG:-<미설정>}" >&2
+    exit 1
+}
+trap on_exit EXIT
+
+DEFAULT_FPR_FILE='/etc/erp-deploy/expected-fingerprint'
+FPR_FILE="$DEFAULT_FPR_FILE"
+FPR_OVERRIDE=''
+if [ -n "${ERP_FPR_FILE:-}" ] && [ "$ERP_FPR_FILE" != "$DEFAULT_FPR_FILE" ]; then
+    if [ -e "$DEFAULT_FPR_FILE" ]; then
+        FPR_OVERRIDE='ignored'          # 사전 배치 앵커가 있으면 그것이 이긴다
+    elif [ "${ERP_ALLOW_UNSAFE_ANCHOR:-}" = '1' ]; then
+        FPR_FILE="$ERP_FPR_FILE"
+        FPR_OVERRIDE='unsafe'           # 개발·테스트용. 판정 줄에 그렇게 찍는다
+    else
+        FPR_OVERRIDE='refused'
+    fi
+fi
 LOG="${ERP_LOG:-/var/log/erp-verify.log}"
 
 # --- 로그 ---------------------------------------------------------------
@@ -84,7 +112,11 @@ die() {   # 종료코드, 원인, 조치
 # 번들에서 나온 문자열은 그대로 찍지 않는다. 매니페스트에 스크립트 자기 출력과 똑같이
 # 생긴 줄을 넣으면 감사 로그가 위조되고, ANSI 이스케이프는 화면을 지운다.
 untrusted() {
-    tr -cd '[:print:]\n' | head -c 2048 | sed 's/^/      | /'
+    tr -cd '[:print:]\n' | awk -v max=2048 '
+        BEGIN { n = 0; skipped = 0 }
+        { if (n + length($0) + 1 <= max) { n += length($0) + 1; print "      | " $0 }
+          else { skipped++ } }
+        END { if (skipped > 0) printf "      | ... (%d줄 더 있음, %d바이트에서 절단됨)\n", skipped, max }'
 }
 
 # 지문 정규화. 대역 외 지문은 메일·Windows PC 를 거쳐 오므로 CRLF·탭·4자리 공백
@@ -164,17 +196,27 @@ say "[1/4] 체크섬 일치 ($ACTUAL_SUM)"
 # 파일이 있으면 그것이 최종 판정값이다. 환경변수는 파일이 없을 때만 쓰인다.
 EXPECTED_FPR=""
 FPR_SOURCE=""
-if [ -n "${ERP_FPR_FILE:-}" ] && [ ! -e "$FPR_FILE" ]; then
-    die 5 "지정한 기대 지문 파일이 없습니다: $FPR_FILE" \
-        "ERP_FPR_FILE 로 경로를 지정했으나 그 파일이 없습니다. 앵커를 우회하려는 시도일 수 있습니다. 환경변수를 지우고 사전 배치된 앵커로 실행하십시오."
-fi
+case "$FPR_OVERRIDE" in
+    refused)
+        die 5 "ERP_FPR_FILE 로 앵커 경로를 바꾸려 했습니다" \
+            "앵커 값은 사전 배치된 위치에서만 옵니다. 번들에 딸려온 안내서를 따르지 마십시오 — 그 안내서는 검증 대상과 같은 경로로 왔습니다. 환경변수를 지우고 다시 실행하십시오." ;;
+    unsafe)
+        # 우회 모드에서도 지정한 경로가 없으면 '미지정' 으로 강등되면 안 된다.
+        [ -e "$FPR_FILE" ] || die 5 "지정한 기대 지문 파일이 없습니다: $FPR_FILE" \
+            "ERP_FPR_FILE 로 경로를 지정했으나 그 파일이 없습니다. 앵커가 없는 상태로 검증이 통과하는 것을 막기 위해 거부합니다." ;;
+    ignored)
+        say "      알림: ERP_FPR_FILE 이 설정되어 있으나 무시합니다 — 사전 배치 앵커가 우선입니다" ;;
+esac
 if [ -e "$FPR_FILE" ]; then
+    [ -f "$FPR_FILE" ] || die 5 "기대 지문 경로가 일반 파일이 아닙니다: $FPR_FILE" \
+        "디렉터리이거나 특수 파일입니다. 프로비저닝을 확인하십시오 (mkdir -p 를 파일 경로에 실행한 경우가 흔합니다)."
     [ -r "$FPR_FILE" ] || die 5 "기대 지문 파일을 읽을 수 없습니다: $FPR_FILE" \
         "권한을 확인하십시오. 이 파일은 설치 가부를 결정하는 값입니다."
     EXPECTED_FPR="$(normalize_fpr < "$FPR_FILE")"
     [ -n "$EXPECTED_FPR" ] || die 5 "기대 지문 파일이 비어 있습니다: $FPR_FILE" \
         "앵커가 배치된 것처럼 보이지만 값이 없습니다. 공급사에 지문을 재요청하십시오."
     FPR_SOURCE="$FPR_FILE"
+    [ "$FPR_OVERRIDE" != 'unsafe' ] || FPR_SOURCE="$FPR_FILE (앵커 우회 모드)"
     if [ -n "${ERP_EXPECTED_FPR:-}" ]; then
         say "      알림: ERP_EXPECTED_FPR 이 설정되어 있으나 무시합니다 — 앵커 파일이 우선입니다"
     fi
@@ -213,8 +255,11 @@ fi
 # VALIDSIG 의 3번째 필드는 '서명에 쓰인 키' 지문, 마지막 필드는 primary 키 지문이다.
 # 전용 서명 서브키를 쓰면 둘이 다르고, 운영자가 등록하는 값은 primary 다
 # (`gpg --fingerprint` 가 보여주는 것). primary 로 대조하지 않으면 정상 번들이 거짓 거부된다.
-SIGNING_FPR="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $3; exit}')"
-PRIMARY_FPR="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $NF; exit}')"
+ALL_SIGNING="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $3}')"
+ALL_PRIMARY="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $NF}')"
+SIG_COUNT="$(printf '%s\n' "$ALL_PRIMARY" | grep -c . || true)"
+SIGNING_FPR="$(printf '%s\n' "$ALL_SIGNING" | head -1)"
+PRIMARY_FPR="$(printf '%s\n' "$ALL_PRIMARY" | head -1)"
 ACTUAL_FPR="${PRIMARY_FPR:-$SIGNING_FPR}"
 
 if ! status GOODSIG; then
@@ -224,10 +269,12 @@ if ! status GOODSIG; then
         "체크섬은 통과했으나 서명이 맞지 않습니다. 운반 구간에서 내용이 바뀌었을 가능성이 있습니다. 설치하지 말고 공급사에 즉시 연락하십시오."
 fi
 
-say "[2/4] 서명 유효"
-say "      primary 키 지문: ${PRIMARY_FPR:-<확인 불가>}"
-if [ -n "$SIGNING_FPR" ] && [ "$SIGNING_FPR" != "$PRIMARY_FPR" ]; then
-    say "      서명 서브키 지문: $SIGNING_FPR"
+say "[2/4] 서명 유효 — 유효 서명 ${SIG_COUNT}개"
+# .asc 는 서명되지 않은 컨테이너다. 운반 구간에서 서명 블록을 덧붙일 수 있으므로
+# 개수와 서명자 전부를 남긴다. 하나만 찍으면 공동 서명이 기록에서 사라진다.
+printf '%s\n' "$ALL_PRIMARY" | grep . | sed 's/^/      서명자: /' | tee -a "$LOG" || true
+if [ "$SIG_COUNT" -gt 1 ]; then
+    say "      경고: 서명이 여러 개입니다. 정품 서명에 다른 서명이 덧붙었을 수 있습니다."
 fi
 
 # --- 4. 지문 대조 -------------------------------------------------------
@@ -235,7 +282,10 @@ fi
 # 다른 키를 임포트하는 순간 그 성공은 의미가 없어진다.
 if [ -n "$EXPECTED_FPR" ]; then
     say "      기대 서명자 지문: $EXPECTED_FPR ($FPR_SOURCE)"
-    if [ "$EXPECTED_FPR" != "$ACTUAL_FPR" ] && [ "$EXPECTED_FPR" != "$SIGNING_FPR" ]; then
+    # 서명 중 **하나라도** 앵커와 맞으면 통과한다. 첫 번째만 보면 공격자가 번들을
+    # 건드리지 않고 자기 서명을 앞에 덧붙이는 것만으로 거짓 exit 14 를 반복 생성할 수
+    # 있고, exit 14 는 '즉시 연락' 경로다 — 거짓 경보가 반복되면 그 경로가 안 믿긴다.
+    if ! printf '%s\n%s\n' "$ALL_PRIMARY" "$ALL_SIGNING" | grep -qxF "$EXPECTED_FPR"; then
         die 14 "서명자가 기대 지문과 다릅니다 (서명 불일치)" \
             "유효한 서명이지만 등록된 공급사 키가 아닙니다. 설치하지 말고 공급사에 연락하십시오."
     fi
@@ -262,18 +312,24 @@ MANIFESTS="$(printf '%s\n' "$TAR_LIST" | grep -E '(^|/)manifest\.(json|ya?ml)$' 
 [ -n "$INSTALLS" ] || die 15 "번들에 install.sh 가 없습니다" \
     "번들 생성이 불완전합니다. 공급사에 문의하십시오."
 
-# 버전 디렉터리 집합. install.sh 가 있는 디렉터리와 매니페스트가 있는 디렉터리는
-# 1:1 이어야 한다. 한쪽만 있으면 그 버전은 반쪽으로 포장된 것이다.
-dirs_of() { sed 's#[^/]*$##; s#/$##; s#^$#.#' | sort -u; }
+# 빈 입력을 '.' 로 접지 않는다. 접으면 실재하지 않는 디렉터리가 집합에 들어간다.
+dirs_of() { grep . | sed 's#[^/]*$##; s#/$##; s#^$#.#' | sort -u || true; }
 INSTALL_DIRS="$(printf '%s\n' "$INSTALLS" | dirs_of)"
 MANIFEST_DIRS="$(printf '%s\n' "$MANIFESTS" | dirs_of)"
 
-MISSING_INSTALL="$(comm -13 <(printf '%s\n' "$INSTALL_DIRS") <(printf '%s\n' "$MANIFEST_DIRS") || true)"
+# **최상위(`.`) 매니페스트는 묶음 신원이지 버전이 아니다.** 버전 디렉터리는
+# install.sh 가 있는 하위 디렉터리로만 센다. 묶음 매니페스트 1개 + 버전별
+# install.sh 구조와 버전별 매니페스트 구조를 둘 다 받는다 — 어느 쪽을 쓸지는
+# #19 의 미결 ADR 이고, 검증 스크립트가 그 결정을 대신 내려서는 안 된다.
+VERSION_DIRS="$(printf '%s\n' "$INSTALL_DIRS" | grep -v '^\.$' || true)"
+MANIFEST_VDIRS="$(printf '%s\n' "$MANIFEST_DIRS" | grep -v '^\.$' || true)"
+
+MISSING_INSTALL="$(comm -13 <(printf '%s\n' "$VERSION_DIRS") <(printf '%s\n' "$MANIFEST_VDIRS") || true)"
 MISSING_MANIFEST="$(comm -23 <(printf '%s\n' "$INSTALL_DIRS") <(printf '%s\n' "$MANIFEST_DIRS") || true)"
 
-if [ -n "$MISSING_INSTALL" ]; then
-    say "      매니페스트는 있으나 install.sh 가 없는 위치:"
-    printf '%s\n' "$MISSING_INSTALL" | sed 's/^/        /' | tee -a "$LOG"
+if [ -n "$(printf '%s' "$MISSING_INSTALL" | tr -d '[:space:]')" ]; then
+    say "      버전 매니페스트는 있으나 install.sh 가 없는 위치:"
+    printf '%s\n' "$MISSING_INSTALL" | grep . | sed 's/^/        /' | tee -a "$LOG" || true
     die 15 "일부 버전에 install.sh 가 없습니다" \
         "번들 생성이 불완전합니다. 공급사에 문의하십시오. 이 상태로 설치하면 해당 버전을 적용할 수 없습니다."
 fi
@@ -281,18 +337,28 @@ fi
 say "[4/4] 번들 구조 확인 — 설치 스크립트 $(printf '%s\n' "$INSTALLS" | wc -l | tr -d ' ')개 (모두 서명 범위에 포함됨)"
 printf '%s\n' "$INSTALLS" | sed 's/^/        /' | tee -a "$LOG"
 
-if [ -n "$MISSING_MANIFEST" ]; then
-    say "      경고: 매니페스트가 없는 위치 — 번들 신원을 확인할 수 없습니다:"
-    printf '%s\n' "$MISSING_MANIFEST" | sed 's/^/        /' | tee -a "$LOG"
+if [ -n "$(printf '%s' "$MISSING_MANIFEST" | tr -d '[:space:]')" ]; then
+    say "      경고: 매니페스트가 없는 위치 — 그 위치의 신원을 확인할 수 없습니다:"
+    printf '%s\n' "$MISSING_MANIFEST" | grep . | sed 's/^/        /' | tee -a "$LOG" || true
 fi
 
-if [ -n "$MANIFESTS" ]; then
+if [ -z "$MANIFESTS" ]; then
+    say "      경고: 번들에 매니페스트가 없습니다 — 신원(버전·빌드 SHA·이미지 다이제스트)이 감사 로그에 남지 않습니다"
+else
     say "      번들 신원:"
     while IFS= read -r m; do
         [ -n "$m" ] || continue
-        say "      [$m]"
-        tar -xOf "$BUNDLE" "./$m" 2>/dev/null || tar -xOf "$BUNDLE" "$m" 2>/dev/null || true
-    done <<< "$MANIFESTS" | untrusted | tee -a "$LOG"
+        # 경로도 번들에서 온 문자열이다. 격리 없이 로그에 쓰면 tar 의 escape quoting
+        # 에만 기대게 된다 — 구현·옵션이 바뀌면 감사 로그 위조가 경로명으로 되살아난다.
+        printf '%s\n' "[$m]" | untrusted | tee -a "$LOG"
+        if MANIFEST_BODY="$(tar -xOf "$BUNDLE" "./$m" 2>/dev/null)" ||
+           MANIFEST_BODY="$(tar -xOf "$BUNDLE" "$m" 2>/dev/null)"; then
+            # 파일마다 상한을 건다. 전체 합산으로 걸면 뒤 버전이 조용히 사라진다.
+            printf '%s\n' "$MANIFEST_BODY" | untrusted | tee -a "$LOG"
+        else
+            say "      경고: $m 을 읽을 수 없습니다 — 이 위치의 신원이 기록되지 않습니다"
+        fi
+    done <<< "$MANIFESTS"
 fi
 
 {
@@ -300,8 +366,8 @@ fi
     printf '  검증 통과 (verify-bundle.sh %s)\n' "$SCRIPT_VERSION"
     printf '\n'
     printf '  이제 설치를 진행할 수 있습니다. 적용할 버전의 스크립트를 고르십시오:\n'
-    printf '    tar -xf %s -C <작업디렉터리>\n' "$BUNDLE"
-    printf '%s\n' "$INSTALLS" | sed 's#^#    <작업디렉터리>/#'
+    printf "    tar -xf '%s' -C <작업디렉터리>\n" "$BUNDLE"
+    printf '%s\n' "$INSTALLS" | sed "s#^#    '<작업디렉터리>/#; s#\$#'#"
     printf '\n'
     printf '  로그: %s\n' "$LOG"
     printf '\n'
