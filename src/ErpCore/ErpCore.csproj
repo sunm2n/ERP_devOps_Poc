@@ -2,16 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <!-- NU1900 은 'NuGetAudit 이 취약점 DB 에 못 닿음' 이다. 에러로 두면 폐쇄망 빌드(H8)가
-         패키지 캐시가 완전히 따뜻해도 실패한다. 그때 가장 빠른 손이 TreatWarningsAsErrors 를
-         끄는 것이고, 그러면 NU1901~1904(실제 알려진 취약점)까지 함께 침묵한다.
-         감사 '실패' 만 떼고 감사 '결과' 는 에러로 남긴다. -->
-    <WarningsNotAsErrors>NU1900;NU1905</WarningsNotAsErrors>
-    <!-- 같은 커밋이 같은 의존성으로 복원되어야 한다 (plan.md 1단계, H1 재현성). -->
-    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- Nullable · TreatWarningsAsErrors · WarningsNotAsErrors · RestorePackagesWithLockFile 은
+         저장소 루트 Directory.Build.props 에 있다. 여기 복제하지 않는다. -->
     <!-- 번들 크기가 plan.md 5장 핵심 지표다. 불필요한 것을 처음부터 넣지 않는다. -->
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>

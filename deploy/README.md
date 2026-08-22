@@ -101,6 +101,60 @@ exit 14("즉시 연락")를 반복 생성할 수 있다 — 거짓 경보가 반
  "description":"database reachable at db:5432/erp"}}}
 ```
 
+### 헬스체크 실패 원인 → 조치
+
+`description` 의 마지막 토큰이 조치를 가른다. 담당자가 전화로 이 한 줄만 읽으면 된다.
+
+| 원인 토큰 | 뜻 | 누가 고치는가 |
+| --- | --- | --- |
+| `PostgresException SqlState=28P01` | 자격증명 불일치 | **재운반 불필요.** `ERP_DB_CONNECTION` 의 계정·비밀번호 확인 |
+| `PostgresException SqlState=3D000` | 해당 DB 가 없음 | DB 생성 여부 확인 (마이그레이션 미실행일 수 있음) |
+| `PostgresException SqlState=53300` | 커넥션 한도 초과 | DB 측 `max_connections` |
+| `SocketException HostNotFound` | 호스트명이 안 풀림 | DNS 또는 `/etc/hosts` |
+| `NpgsqlException SocketException ConnectionRefused` | 포트는 닿는데 거부 | **DB 컨테이너가 안 떴다** |
+| `ConnectTimeout after Ns (방화벽·라우팅 확인)` | 패킷이 사라짐 | **고객사 망 담당자 소관.** 폐쇄망 최초 설치에서 가장 흔하다 |
+| `ArgumentException '<키>' 키` | 연결 문자열 파손 | 그 키만 확인하면 된다 (값을 불러줄 필요 없음) |
+
+`connectionSource` 도 함께 본다 — `default` 면 **환경변수 주입 자체가 누락**된 것이고,
+그때 나오는 `SocketException`(localhost 를 두드림)은 DB 장애가 아니다.
+
+`buildIdentity` 가 `missing-commit-sha` 면 **`build` 대조가 무의미하다** — 빌드 시
+`-p:SourceRevisionId=<커밋SHA>` 주입이 빠진 것이고, 그러면 컨테이너가 교체되지 않아도
+대조가 통과한다.
+
+### #20(설치 스크립트)이 구현해야 할 계약
+
+| 항목 | 값 |
+| --- | --- |
+| 대기 대상 | `GET http://127.0.0.1:8080/health` 가 **200** |
+| 폴링 간격 | 2초 |
+| 최대 대기 | **600초** (`docker load` 수백 MB 3~5분이 앞에 붙는다) |
+| 초과 시 종료 코드 | **20** (`verify-bundle.sh` 의 0~16·130 과 겹치지 않게 20번대를 쓴다) |
+| 503 수신 시 | 상한을 다 기다리지 않고 **즉시 본문을 출력**한다 — 떴는데 Unhealthy 면 원인이 이미 응답에 있다 |
+| `build` 대조 | 번들 매니페스트의 `commit`(SHA 40자)이 헬스 응답 `build` 의 **`+` 뒤 문자열과 앞자리 일치**하는지 본다. `build` 는 `1.0.0+<SHA>` 형식이라 **순진한 동등 비교는 항상 실패한다** |
+| 본문 저장 | `curl -sf` 를 쓰지 않는다 — `-f` 는 비-2xx 에서 본문을 버린다. `curl -s -o /var/log/erp-install-health.json -w '%{http_code}'` |
+
+```sh
+# 예시
+deadline=$(( $(date +%s) + 600 ))
+while :; do
+  code="$(curl -s -o /var/log/erp-install-health.json -w '%{http_code}'           http://127.0.0.1:8080/health || echo 000)"
+  [ "$code" = 200 ] && break
+  if [ "$code" = 503 ]; then
+      echo "기동했으나 준비되지 않았습니다:"; cat /var/log/erp-install-health.json; exit 20
+  fi
+  [ "$(date +%s)" -lt "$deadline" ] || { echo "대기 상한 초과"; cat /var/log/erp-install-health.json; exit 20; }
+  sleep 2
+done
+```
+
+**`curl` 이 없는 VM 이 있다.** `bash /dev/tcp` 는 상태 코드도 본문도 못 읽으므로 폴백이
+아니다 — `curl` 또는 `wget` 을 VM 사전 요구사항에 넣는다.
+
+**`Degraded` 를 도입하지 않는다.** `MapHealthChecks` 기본 매핑이 Healthy/Degraded=200 이라,
+나중에 `Degraded` 를 하나 넣는 순간 **"200 이면 적용 완료" 계약이 조용히 뒤집힌다** —
+반쯤 아픈 배포가 완료로 기록된다. 필요해지면 `ResultStatusCodes` 에서 503 으로 옮긴다.
+
 **포트는 8080 이다** (`aspnet` 컨테이너 이미지 기본값). SDK 이미지로 `dotnet run` 하면
 5000 이라 개발과 배포의 프로브 URL 이 다르다 — 절차서에는 **배포 기준인 8080** 을 쓴다.
 

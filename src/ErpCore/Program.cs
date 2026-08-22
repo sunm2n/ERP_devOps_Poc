@@ -51,6 +51,13 @@ var buildId = Assembly.GetEntryAssembly()
     ?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
     ?.InformationalVersion ?? "unknown";
 
+// **SHA 는 빌드 컨텍스트에 .git 이 있을 때만 붙는다**(SDK 내장 SourceLink). #12 의
+// Dockerfile 이 `COPY src/` 만 하면 — 가장 자연스러운 형태다 — v1.0~v1.3 이 전부
+// `1.0.0` 이 되고, deploy/README.md 가 계약으로 삼은 `build` 대조는 **항상 일치하므로
+// 언제나 통과**한다. 무증상 실패라 이 경고 없이는 아무도 못 알아챈다.
+// 빌드 시 `-p:SourceRevisionId=$CI_COMMIT_SHA` 로 주입해야 한다.
+var buildIdentityMissing = !buildId.Contains('+');
+
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<OrderStore>();
 builder.Services.AddHealthChecks()
@@ -71,7 +78,7 @@ app.MapHealthChecks("/health", new HealthCheckOptions
 {
     Predicate = check => check.Tags.Contains("ready"),
     ResponseWriter = (context, report) =>
-        WriteHealthResponse(context, report, buildId, connectionSource),
+        WriteHealthResponse(context, report, buildId, buildIdentityMissing, connectionSource),
 });
 
 app.Logger.LogInformation(
@@ -79,6 +86,10 @@ app.Logger.LogInformation(
     buildId, connectionSource, timeoutSeconds);
 if (timeoutWarning is not null)
     app.Logger.LogWarning("{Warning}", timeoutWarning);
+if (buildIdentityMissing)
+    app.Logger.LogWarning(
+        "빌드 신원에 커밋 SHA 가 없습니다 ({BuildId}). 배포 검증의 build 대조가 항상 통과합니다 — "
+        + "빌드 시 -p:SourceRevisionId=<커밋SHA> 를 주입하십시오.", buildId);
 
 // --- 업무 엔드포인트 ----------------------------------------------------
 // plan.md 2장: "실제 ERP 비즈니스 로직" 은 범위 밖이다. 배포 파이프라인이 실어 나를
@@ -123,7 +134,8 @@ orders.MapGet("/", (OrderStore store) => Results.Ok(store.All()));
 app.Run();
 
 static Task WriteHealthResponse(
-    HttpContext context, HealthReport report, string buildId, string connectionSource)
+    HttpContext context, HealthReport report,
+    string buildId, bool buildIdentityMissing, string connectionSource)
 {
     context.Response.ContentType = "application/json; charset=utf-8";
 
@@ -132,6 +144,9 @@ static Task WriteHealthResponse(
         status = report.Status.ToString(),
         // 배포 스크립트(#20)가 이 값을 기대값과 대조하면 '적용 완료' 판정이 근거를 갖는다.
         build = buildId,
+        // 신원이 없으면 그 사실을 드러낸다. 조용히 1.0.0 을 반환하면 배포 검증이
+        // '항상 일치' 로 통과하고, 컨테이너가 교체되지 않은 것을 아무도 못 잡는다.
+        buildIdentity = buildIdentityMissing ? "missing-commit-sha" : "ok",
         connectionSource,
         durationMs = report.TotalDuration.TotalMilliseconds,
         checks = report.Entries.ToDictionary(

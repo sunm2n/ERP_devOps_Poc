@@ -70,12 +70,16 @@ jobs:
       - uses: actions/setup-dotnet@v4
         if: steps.check.outputs.exists == 'true'
         with:
-          dotnet-version: '10.0.x'
+          # SDK 핀은 한 곳이어야 한다. `dotnet-version: '10.0.x'` 는 그때그때 최신 패치를
+          # 깔고 global.json 은 rollForward:disable 로 정확 일치를 요구하므로, MS 가 다음
+          # 패치를 내는 날 **커밋 없이** 모든 PR 이 RC=155 로 죽는다.
+          global-json-file: global.json
       - if: steps.check.outputs.exists == 'true'
         # `dotnet build <디렉터리>` 는 그 디렉터리에 프로젝트/솔루션이 **직접** 있을 때만
         # 동작한다 — src/ErpCore/ErpCore.csproj 만 있던 시점에 이 스텝이 MSB1003 으로 깨졌다.
         run: |
           set -euo pipefail
+
           sln="$(find src -maxdepth 2 \( -name '*.sln' -o -name '*.slnx' \) | sort | head -1)"
 
           if [ -z "$sln" ]; then
@@ -89,16 +93,44 @@ jobs:
           echo "solution: $sln"
 
           # 솔루션에 등록되지 않은 프로젝트는 **컴파일조차 되지 않은 채 초록불**이 된다.
-          # 다음 이슈(#9)가 테스트 프로젝트를 추가하며 등록을 잊으면 그대로 새는 자리다.
-          found="$(find src -name '*.csproj' | wc -l | tr -d ' ')"
-          listed="$(grep -c 'Path=' "$sln" || true)"
-          if [ "$found" != "$listed" ]; then
-            echo "::error::src 아래 csproj $found 개 중 솔루션에 등록된 것은 $listed 개입니다."
-            echo "::error::등록되지 않은 프로젝트는 빌드되지 않은 채 CI 가 통과합니다."
-            find src -name '*.csproj' | sed 's/^/  found: /'
-            grep 'Path=' "$sln" | sed 's/^/  listed:/'
+          # 개수만 대조하면 안 된다 — .slnx 의 <Folder Path=>·<File Path=> 까지 세므로
+          # 솔루션 폴더 2줄이 미등록 프로젝트 2개를 정확히 상쇄해 **미탐**한다(실측).
+          # `dotnet sln list` 로 등록 목록을 뽑아 경로 집합으로 비교하면 포맷 파싱이
+          # 사라지고 고전 .sln 도 함께 커버된다.
+          # `|| true` 로 삼키지 않는다. 솔루션 파일이 깨졌을 때 그것을 커버리지 불일치로
+          # 보고하면 진단이 엉뚱한 곳을 가리킨다 (실측: 잘못된 Folder 문법 -> sln list 가
+          # rc=1 + 사유를 내는데, 삼키면 '등록 0개' 로만 보인다).
+          if ! sln_out="$(dotnet sln "$sln" list 2>&1)"; then
+            echo "::error::솔루션 파일을 읽을 수 없습니다: $sln"
+            printf '%s\n' "$sln_out"
             exit 1
           fi
+          printf '%s\n' "$sln_out" \
+            | grep -E '\.csproj$' \
+            | tr '\\' '/' \
+            | sed 's#^#src/#' \
+            | sort -u > /tmp/listed.txt
+          find src -name '*.csproj' | sort -u > /tmp/found.txt
+
+          if ! diff -u /tmp/listed.txt /tmp/found.txt > /tmp/cov.diff; then
+            echo "::error::솔루션 등록 목록과 src 아래 실제 프로젝트가 다릅니다."
+            echo "::error::등록되지 않은 프로젝트는 빌드되지 않은 채 CI 가 통과합니다."
+            echo '--- 솔루션 등록 (-) vs 실제 발견 (+) ---'
+            cat /tmp/cov.diff
+            exit 1
+          fi
+
+          # 잠금 파일이 없는 프로젝트는 잠금 모드 복원을 **조용히 통과**한다.
+          # RestorePackagesWithLockFile 은 Directory.Build.props 에 있지만, 그걸
+          # 우회하는 프로젝트가 생기면 재현성 보증이 그 프로젝트에만 없어진다.
+          missing=0
+          while IFS= read -r proj; do
+            [ -f "$(dirname "$proj")/packages.lock.json" ] || {
+              echo "::error::잠금 파일 없음: $proj"
+              missing=1
+            }
+          done < /tmp/found.txt
+          [ "$missing" -eq 0 ] || exit 1
 
           # 잠금 파일과 어긋나면 실패시킨다. 같은 커밋이 다른 의존성으로 복원되면
           # plan.md 1단계의 "같은 커밋 -> 같은 이미지" 근거가 사라진다.

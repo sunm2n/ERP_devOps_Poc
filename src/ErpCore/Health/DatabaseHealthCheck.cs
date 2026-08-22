@@ -24,6 +24,7 @@ public sealed class DatabaseHealthCheck : IHealthCheck
     private readonly string _connectionString;
     private readonly string _endpoint;
     private readonly TimeSpan _timeout;
+    private readonly int _connectTimeoutSeconds;
 
     public DatabaseHealthCheck(string connectionString, TimeSpan timeout)
     {
@@ -36,18 +37,32 @@ public sealed class DatabaseHealthCheck : IHealthCheck
         try
         {
             var builder = new NpgsqlConnectionStringBuilder(connectionString);
-            var connectTimeout = Math.Max(1, (int)Math.Floor(timeout.TotalSeconds) - 1);
-            if (builder.Timeout > connectTimeout)
-                builder.Timeout = connectTimeout;
+
+            // Npgsql 에서 Timeout=0 은 **무한대**다. `builder.Timeout > connectTimeout` 만
+            // 보면 0 이 통과해(0 > 2 는 거짓) 막으려던 붕괴가 그대로 일어난다.
+            _connectTimeoutSeconds = Math.Max(1, (int)Math.Floor(timeout.TotalSeconds) - 1);
+            if (builder.Timeout == 0 || builder.Timeout > _connectTimeoutSeconds)
+                builder.Timeout = _connectTimeoutSeconds;
 
             _connectionString = builder.ConnectionString;
             _endpoint = $"{builder.Host}:{builder.Port}/{builder.Database}";
         }
-        catch (Exception ex)
+        catch (ArgumentException ex)
         {
             // 파싱 실패도 검사 시점에 보고한다. 여기서 던지면 앱이 기동조차 못 하고
             // 폐쇄망에서는 그 이유가 화면에 안 나온다.
+            // **ParamName 에 어느 키가 틀렸는지가 들어 있고 값은 안 들어 있다** —
+            // 없으면 담당자에게 연결 문자열을 통째로 불러달라고 해야 하는데
+            // 그 안에 비밀번호가 있어 전화로 못 읽는다.
             _connectionString = connectionString;
+            _connectTimeoutSeconds = Math.Max(1, (int)Math.Floor(timeout.TotalSeconds) - 1);
+            // 키 이름은 Describe 가 낸다. 여기서 또 붙이면 한 줄에 두 번 나온다.
+            _endpoint = "<연결 문자열 파손>";
+        }
+        catch (Exception ex)
+        {
+            _connectionString = connectionString;
+            _connectTimeoutSeconds = Math.Max(1, (int)Math.Floor(timeout.TotalSeconds) - 1);
             _endpoint = $"<연결 문자열 파손: {ex.GetType().Name}>";
         }
     }
@@ -81,7 +96,7 @@ public sealed class DatabaseHealthCheck : IHealthCheck
     }
 
     /// <summary>조치가 갈리는 지점까지만 노출한다. 자격증명·예외 메시지 원문은 담지 않는다.</summary>
-    private static string Describe(Exception ex) => ex switch
+    private string Describe(Exception ex) => ex switch
     {
         // SqlState 는 5자 고정 집합이다. 28P01=비밀번호 틀림, 3D000=DB 없음, 53300=커넥션 한도.
         PostgresException pg => $"PostgresException SqlState={pg.SqlState}",
@@ -89,6 +104,15 @@ public sealed class DatabaseHealthCheck : IHealthCheck
         SocketException se => $"SocketException {se.SocketErrorCode}",
         NpgsqlException { InnerException: SocketException inner }
             => $"NpgsqlException SocketException {inner.SocketErrorCode}",
+        // **방화벽 DROP·라우팅 없음이 여기로 온다** — 폐쇄망 최초 설치에서 가장 흔한 원인이고,
+        // 유일하게 고객사 망 담당자가 우리 없이 고칠 수 있는 칸이다. 이 arm 이 없으면
+        // 'NpgsqlException' 한 단어로 붕괴해 ConnectionRefused(DB 미기동)와 구분되지 않는다.
+        // 연결 타임아웃을 코드에서 강제한 결과 Npgsql 이 먼저 던지므로,
+        // 아래 OperationCanceledException 분기에는 도달하지 않는다.
+        NpgsqlException { InnerException: TimeoutException }
+            => $"ConnectTimeout after {_connectTimeoutSeconds}s (방화벽·라우팅 확인)",
+        ArgumentException ae when ae.ParamName is { Length: > 0 } key
+            => $"ArgumentException '{key}' 키",
         _ => ex.GetType().Name,
     };
 }
