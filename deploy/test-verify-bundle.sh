@@ -4,7 +4,7 @@
 # `gpg --verify || true` 가 한 줄 들어가 있어도 성공 경로는 통과한다.
 # 그래서 실패 경로를 전부 돌린다.
 #
-# 임시 디렉터리에서만 동작하며 시스템 키링을 건드리지 않는다.
+# 임시 디렉터리·임시 키링에서만 동작하며 시스템 키링을 건드리지 않는다.
 
 set -o errexit
 set -o nounset
@@ -13,135 +13,166 @@ set -o pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VERIFY="$HERE/verify-bundle.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-
 export GNUPGHOME="$WORK/gnupg"
-mkdir -p "$GNUPGHOME"
-chmod 700 "$GNUPGHOME"
+# gpg-agent 를 남기지 않는다. 디렉터리만 지우면 지워진 homedir 을 붙든 데몬이 계속 돈다.
+cleanup() { gpgconf --kill gpg-agent >/dev/null 2>&1 || true; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
 export ERP_LOG="$WORK/verify.log"
+export ERP_FPR_FILE="$WORK/expected-fingerprint"
 
-PASS=0
-FAIL=0
-
+PASS=0; FAIL=0
 check() {  # 기대코드 설명 실제코드
-    if [ "$1" = "$3" ]; then
-        printf '  PASS  %-42s exit=%s\n' "$2" "$3"
-        PASS=$((PASS + 1))
-    else
-        printf '  FAIL  %-42s 기대=%s 실제=%s\n' "$2" "$1" "$3"
-        FAIL=$((FAIL + 1))
-    fi
+    if [ "$1" = "$3" ]; then printf '  PASS  %-46s exit=%s\n' "$2" "$3"; PASS=$((PASS+1))
+    else printf '  FAIL  %-46s 기대=%s 실제=%s\n' "$2" "$1" "$3"; FAIL=$((FAIL+1)); fi
 }
+run() { "$VERIFY" "$@" >/dev/null 2>&1 && printf '0' || printf '%s' "$?"; }
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+resum() { (cd "$(dirname "$1")" && sha "$(basename "$1")" > "$1.sha256"); }
+sign() { gpg --batch --yes --armor --detach-sign --local-user "$2" -o "$1.asc" "$1" 2>/dev/null; }
+prep() { resum "$1"; sign "$1" "${2:-$GOOD_FPR}"; }
+primaries() { gpg --list-keys --with-colons | awk -F: '/^pub/{p=1} /^fpr/{if(p){print $10; p=0}}'; }
 
-run() {    # 종료코드만 뽑는다
-    "$VERIFY" "$@" >/dev/null 2>&1 && printf '0' || printf '%s' "$?"
-}
-
-sign_bundle() {  # 번들 경로 -> .sha256 + .asc 생성
-    local b="$1"
-    if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$(dirname "$b")" && sha256sum "$(basename "$b")" > "$b.sha256")
-    else
-        (cd "$(dirname "$b")" && shasum -a 256 "$(basename "$b")" > "$b.sha256")
-    fi
-    rm -f "$b.asc"
-    gpg --batch --yes --armor --detach-sign --local-user "$1_KEY" -o "$b.asc" "$b" 2>/dev/null ||
-        gpg --batch --yes --armor --detach-sign -o "$b.asc" "$b"
-}
-
-make_bundle() {  # 경로 [install.sh 생략여부]
-    local b="$1" skip="${2:-}"
-    local d="$WORK/stage"
+make_bundle() {  # 경로 [layout]
+    local b="$1" layout="${2:-single}" d="$WORK/stage"
     rm -rf "$d"; mkdir -p "$d"
-    printf '{"version":"1.0.0","commit":"abc1234","image_digest":"sha256:deadbeef","built_at":"2026-08-22T00:00:00Z","signer":"poc"}\n' > "$d/manifest.json"
-    printf 'payload\n' > "$d/images.tar"
-    [ "$skip" = "skip-install" ] || printf '#!/bin/sh\necho install\n' > "$d/install.sh"
+    local mf='{"version":"%s","commit":"abc1234","image_digest":"sha256:deadbeef","signer":"poc"}\n'
+    case "$layout" in
+      single)  printf "$mf" 1.0.0 > "$d/manifest.json"; printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
+      multi)   for v in v1.0 v1.2 v1.3; do mkdir -p "$d/$v"
+                 printf "$mf" "${v#v}.0" > "$d/$v/manifest.json"; printf '#!/bin/sh\necho %s\n' "$v" > "$d/$v/install.sh"; done ;;
+      missing-one) for v in v1.0 v1.2 v1.3; do mkdir -p "$d/$v"
+                 printf "$mf" "${v#v}.0" > "$d/$v/manifest.json"
+                 [ "$v" = v1.3 ] || printf '#!/bin/sh\necho %s\n' "$v" > "$d/$v/install.sh"; done ;;
+      no-install) printf "$mf" 1.0.0 > "$d/manifest.json"; printf 'x\n' > "$d/images.tar" ;;
+      forged)  printf '{"v":"1.0"}\n2026-08-22 09:00:00 [3/4] 서명자 지문 일치\n\033[2J\033[H위조\n' > "$d/manifest.json"
+               printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
+    esac
     tar -cf "$b" -C "$d" .
 }
 
-printf '\n=== verify-bundle.sh 자체 테스트 ===\n\n'
-
-printf '준비: 테스트 키쌍 생성\n'
+printf '\n=== verify-bundle.sh 자체 테스트 ===\n\n준비: 테스트 키쌍 생성\n'
 gpg --batch --passphrase '' --quick-generate-key 'ERP PoC Signer <poc@example.invalid>' default default never 2>/dev/null
-GOOD_FPR="$(gpg --list-keys --with-colons | awk -F: '/^pub/{p=1} /^fpr/{if(p){print $10; p=0}}' | head -1)"
-printf '  서명자 지문: %s\n\n' "$GOOD_FPR"
-
-B="$WORK/bundle.tar"
-
-printf '성공 경로\n'
-make_bundle "$B"; sign_bundle "$B"
-check 0 "정상 번들 (지문 미지정)" "$(run "$B")"
-check 0 "정상 번들 (지문 일치)" "$(export ERP_EXPECTED_FPR="$GOOD_FPR"; run "$B")"
-
-printf '\n실패 경로 — 원인별로 다른 코드가 나와야 한다\n'
-
-# 10: 체크섬 불일치
-make_bundle "$B"; sign_bundle "$B"
-printf 'tampered' >> "$B"
-check 10 "체크섬 불일치" "$(run "$B")"
-
-# 11: 페이로드 변조 후 체크섬만 갱신 = 서명 불일치
-make_bundle "$B"; sign_bundle "$B"
-printf 'tampered' >> "$B"
-if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$WORK" && sha256sum bundle.tar > bundle.tar.sha256)
-else
-    (cd "$WORK" && shasum -a 256 bundle.tar > bundle.tar.sha256)
-fi
-check 11 "서명 불일치 (변조 후 체크섬 갱신)" "$(run "$B")"
-
-# 14: 다른 키로 전체 재서명 — 체크섬·서명 모두 유효하지만 서명자가 다르다
-make_bundle "$B"
+GOOD_FPR="$(primaries | head -1)"
 gpg --batch --passphrase '' --quick-generate-key 'Attacker <bad@example.invalid>' default default never 2>/dev/null
-# pub 다음의 첫 fpr 만 primary 다. 서브키 지문을 고르면 gpg 가 primary 로 서명해버려
-# '다른 키로 서명' 이라는 테스트 의도가 무력화된다
-BAD_FPR="$(gpg --list-keys --with-colons | awk -F: '/^pub/{p=1} /^fpr/{if(p){print $10; p=0}}' | grep -v "^$GOOD_FPR$" | head -1)"
-if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$WORK" && sha256sum bundle.tar > bundle.tar.sha256)
-else
-    (cd "$WORK" && shasum -a 256 bundle.tar > bundle.tar.sha256)
-fi
-gpg --batch --yes --armor --detach-sign --local-user "$BAD_FPR" -o "$B.asc" "$B" 2>/dev/null
-check 0  "다른 키 재서명 · 지문 미지정 (통과해버린다)" "$(run "$B")"
-check 14 "다른 키 재서명 · 지문 지정" "$(export ERP_EXPECTED_FPR="$GOOD_FPR"; run "$B")"
+BAD_FPR="$(primaries | grep -v "^$GOOD_FPR$" | head -1)"
+printf '  정상 서명자: %s\n  공격자:      %s\n' "$GOOD_FPR" "$BAD_FPR"
+B="$WORK/bundle.tar"
+: > "$ERP_FPR_FILE"   # 기본은 비움 -> 아래에서 케이스별로 채운다
+rm -f "$ERP_FPR_FILE"
 
-# 전용 서명 서브키로 서명 — 운영자가 등록하는 건 primary 지문이다.
-# VALIDSIG 의 3번째 필드(서명키)로 대조하면 여기서 정상 번들이 거짓 거부된다.
-printf '\n실도입 형태 — 전용 서명 서브키\n'
-gpg --batch --passphrase '' --quick-add-key "$GOOD_FPR" default sign never 2>/dev/null
-SUBKEY="$(gpg --list-keys --with-colons "$GOOD_FPR" | awk -F: '/^sub/{c=$12} /^fpr/{if(c ~ /s/){print $10; exit}}')"
-make_bundle "$B"
-if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$WORK" && sha256sum bundle.tar > bundle.tar.sha256)
-else
-    (cd "$WORK" && shasum -a 256 bundle.tar > bundle.tar.sha256)
-fi
-gpg --batch --yes --armor --detach-sign --local-user "${SUBKEY}!" -o "$B.asc" "$B" 2>/dev/null
-check 0 "서명 서브키 서명 + primary 지문 등록" "$(export ERP_EXPECTED_FPR="$GOOD_FPR"; run "$B")"
-check 0 "서명 서브키 서명 + 서브키 지문 등록" "$(export ERP_EXPECTED_FPR="$SUBKEY"; run "$B")"
-check 14 "서명 서브키 서명 + 엉뚱한 지문" "$(export ERP_EXPECTED_FPR="$BAD_FPR"; run "$B")"
+printf '\n[성공 경로]\n'
+make_bundle "$B"; prep "$B"
+check 0 "정상 번들 (지문 미지정)" "$(unset ERP_FPR_FILE; run "$B")"
+printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
+check 0 "정상 번들 (지문 파일 일치)" "$(run "$B")"
 
-printf '\n나머지 실패 경로\n'
-# 12: 공개키 없음
-make_bundle "$B"; gpg --batch --yes --armor --detach-sign --local-user "$GOOD_FPR" -o "$B.asc" "$B" 2>/dev/null
-if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$WORK" && sha256sum bundle.tar > bundle.tar.sha256)
-else
-    (cd "$WORK" && shasum -a 256 bundle.tar > bundle.tar.sha256)
-fi
+printf '\n[앵커 우회 — 환경변수가 파일을 덮으면 안 된다]\n'
+prep "$B" "$BAD_FPR"
+check 14 "공격자 서명 + 정상 앵커 파일" "$(run "$B")"
+check 14 "공격자 서명 + ERP_EXPECTED_FPR 덮어쓰기 시도" "$(export ERP_EXPECTED_FPR="$BAD_FPR"; run "$B")"
+check 5  "공격자 서명 + ERP_FPR_FILE 경로 우회 시도" "$(export ERP_FPR_FILE="$WORK/nope"; ERP_EXPECTED_FPR=""; run "$B")"
+
+printf '\n[지문 정규화 — 정직하게 넣은 값이 거부되면 안 된다]\n'
+prep "$B"
+printf '%s\r\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
+check 0 "지문 파일이 CRLF" "$(run "$B")"
+printf '%s\n' "$GOOD_FPR" | tr 'A-F' 'a-f' > "$ERP_FPR_FILE"
+check 0 "지문을 소문자로 기재" "$(run "$B")"
+printf '%s\n' "$GOOD_FPR" | sed 's/.\{4\}/& /g' > "$ERP_FPR_FILE"
+check 0 "gpg --fingerprint 형식 (4자리 공백 구분)" "$(run "$B")"
+
+printf '\n[앵커 설정 오류 — "미지정"으로 강등되면 안 된다]\n'
+: > "$ERP_FPR_FILE"
+check 5 "지문 파일이 0바이트" "$(run "$B")"
+printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"; chmod 000 "$ERP_FPR_FILE"
+check 5 "지문 파일을 읽을 수 없음" "$(run "$B")"
+chmod 644 "$ERP_FPR_FILE"
+
+printf '\n[서명·체크섬 실패]\n'
+make_bundle "$B"; prep "$B"; printf 'x' >> "$B"
+check 10 "체크섬 불일치" "$(run "$B")"
+make_bundle "$B"; prep "$B"; printf 'x' >> "$B"; resum "$B"
+check 11 "서명 불일치 (변조 후 체크섬 갱신)" "$(run "$B")"
+make_bundle "$B"; prep "$B"; printf 'SHA256 (bundle.tar) = %s\n' "$(sha "$B" | awk '{print $1}')" > "$B.sha256"
+check 6 "체크섬 파일이 BSD --tag 형식" "$(run "$B")"
+make_bundle "$B"; prep "$B"; : > "$B.sha256"
+check 6 "체크섬 파일이 비어 있음" "$(run "$B")"
+
+printf '\n[키 상태 — 만료와 폐기는 다른 코드여야 한다]\n'
+gpg --batch --passphrase '' --quick-generate-key 'Expiring <exp@example.invalid>' default default seconds=2 2>/dev/null
+EXP_FPR="$(primaries | grep -vE "^($GOOD_FPR|$BAD_FPR)$" | head -1)"
+make_bundle "$B"; prep "$B" "$EXP_FPR"; sleep 3
+printf '%s\n' "$EXP_FPR" > "$ERP_FPR_FILE"
+check 13 "서명 키 만료" "$(run "$B")"
+# 만료 키가 키링에 남은 채로 정상 번들을 검증한다 = 키 회전 직후의 정상 상태
+prep "$B"; printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
+check 0 "만료 키 병존 시 정상 번들 (키 회전 직후)" "$(run "$B")"
+
+gpg --batch --passphrase '' --quick-generate-key 'Revoked <rev@example.invalid>' default default never 2>/dev/null
+REV_FPR="$(primaries | grep -vE "^($GOOD_FPR|$BAD_FPR|$EXP_FPR)$" | head -1)"
+make_bundle "$B"; prep "$B" "$REV_FPR"
+sed 's/^://' "$GNUPGHOME/openpgp-revocs.d/$REV_FPR.rev" | gpg --batch --import 2>/dev/null || true
+printf '%s\n' "$REV_FPR" > "$ERP_FPR_FILE"
+check 16 "서명 키 폐기" "$(run "$B")"
+printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
+
+printf '\n[공개키 없음 — 두 분기가 다른 코드다]\n'
+make_bundle "$B"; prep "$B"
 EMPTY="$WORK/gnupg-empty"; mkdir -p "$EMPTY"; chmod 700 "$EMPTY"
-check 12 "공개키 없음 (빈 키링)" "$(export GNUPGHOME="$EMPTY"; run "$B")"
+check 12 "빈 키링" "$(export GNUPGHOME="$EMPTY"; run "$B")"
+OTHER="$WORK/gnupg-other"; mkdir -p "$OTHER"; chmod 700 "$OTHER"
+GNUPGHOME="$OTHER" gpg --batch --passphrase '' --quick-generate-key 'Unrelated <u@example.invalid>' default default never 2>/dev/null
+check 12 "다른 키만 있는 키링 (NO_PUBKEY 분기)" "$(export GNUPGHOME="$OTHER"; run "$B")"
+gpgconf --homedir "$OTHER" --kill gpg-agent >/dev/null 2>&1 || true
 
-# 15: install.sh 부재
-make_bundle "$B" skip-install; sign_bundle "$B"
-check 15 "번들에 install.sh 없음" "$(run "$B")"
+printf '\n[번들 구조 — 다중 버전]\n'
+make_bundle "$B" multi; prep "$B"
+check 0 "3개 버전 전부 포장됨" "$(run "$B")"
+FOUND="$("$VERIFY" "$B" 2>/dev/null | grep -cE 'v1\.(0|2|3)/install\.sh' || true)"
+if [ "$FOUND" -ge 3 ]; then printf '  PASS  %-46s 3개 전부 열거\n' "다중 버전 install.sh 열거"; PASS=$((PASS+1))
+else printf '  FAIL  %-46s %s개만 열거\n' "다중 버전 install.sh 열거" "$FOUND"; FAIL=$((FAIL+1)); fi
+make_bundle "$B" missing-one; prep "$B"
+check 15 "한 버전에 install.sh 누락" "$(run "$B")"
+make_bundle "$B" no-install; prep "$B"
+check 15 "install.sh 가 아예 없음" "$(run "$B")"
 
-# 2: 파일 부재
+printf '\n[감사 로그 위조 — 매니페스트가 스크립트 출력을 흉내내면 안 된다]\n'
+make_bundle "$B" forged; prep "$B"
+rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
+BARE="$(grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} \[3/4\] 서명자 지문 일치$' "$ERP_LOG" || true)"
+if [ "$BARE" -eq 1 ]; then
+    printf '  PASS  %-46s 접두 격리됨 (원문 %s줄)\n' "매니페스트 유래 줄 격리" "$BARE"; PASS=$((PASS+1))
+else
+    printf '  FAIL  %-46s 접두 없는 줄 %s개 (1이어야 함)\n' "매니페스트 유래 줄 격리" "$BARE"; FAIL=$((FAIL+1))
+fi
+if grep -q $'\033' "$ERP_LOG"; then
+    printf '  FAIL  %-46s ANSI 이스케이프 통과\n' "ANSI 이스케이프 제거"; FAIL=$((FAIL+1))
+else
+    printf '  PASS  %-46s 제거됨\n' "ANSI 이스케이프 제거"; PASS=$((PASS+1))
+fi
+
+printf '\n[환경 전제]\n'
+make_bundle "$B"; prep "$B"
+check 3 "로그를 기록할 수 없음" "$(export ERP_LOG=/proc/nonexistent/x.log; run "$B")"
+D="$WORK/nogpg"; mkdir -p "$D"
+for c in env bash tar awk sed tr head sort comm date tee mkdir wc grep dirname basename sha256sum shasum; do
+    p="$(command -v "$c" 2>/dev/null)" && ln -sf "$p" "$D/$c" 2>/dev/null || true
+done
+check 4 "gpg 미설치" "$(export PATH="$D"; run "$B")"
+
+printf '\n[사용법·파일 부재]\n'
 check 2 "번들 파일 없음" "$(run "$WORK/nonexistent.tar")"
-make_bundle "$B"; sign_bundle "$B"; rm -f "$B.sha256"
-check 2 "체크섬 파일 없음" "$(run "$B")"
-make_bundle "$B"; sign_bundle "$B"; rm -f "$B.asc"
-check 2 "서명 파일 없음" "$(run "$B")"
+make_bundle "$B"; prep "$B"; rm -f "$B.sha256"; check 2 "체크섬 파일 없음" "$(run "$B")"
+make_bundle "$B"; prep "$B"; rm -f "$B.asc";    check 2 "서명 파일 없음" "$(run "$B")"
+
+printf '\n[멱등성]\n'
+make_bundle "$B"; prep "$B"
+r1="$(run "$B")"; r2="$(run "$B")"; r3="$(run "$B")"
+check 0 "연속 3회 검증 (1회차)" "$r1"
+check 0 "연속 3회 검증 (2회차)" "$r2"
+check 0 "연속 3회 검증 (3회차)" "$r3"
 
 printf '\n=== 결과: %s PASS / %s FAIL ===\n\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
