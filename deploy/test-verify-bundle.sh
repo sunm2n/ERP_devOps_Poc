@@ -59,6 +59,18 @@ make_bundle() {  # 경로 [layout]
       big-manifest) for v in v1.0 v1.2 v1.3; do mkdir -p "$d/$v"
                  { printf "$mf" "${v#v}.0"; head -c 4000 /dev/zero | tr '\0' 'x'; printf '\n'; } > "$d/$v/manifest.json"
                  printf '#!/bin/sh\necho %s\n' "$v" > "$d/$v/install.sh"; done ;;
+      # 실제 산출물 형태: docker save 계열 매니페스트는 compact 1줄이다.
+      # 패딩을 다음 줄에 붙이면 JSON 줄이 짧아 절단 결함을 못 잡는다.
+      long-line) for v in v1.0 v1.2 v1.3; do mkdir -p "$d/$v"
+                 { printf '{"version":"%s","commit":"3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a","images":[' "${v#v}.0"
+                   for i in $(seq 1 24); do
+                     [ "$i" -eq 1 ] || printf ','
+                     printf '{"name":"erp-component-%02d","digest":"sha256:9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0"}' "$i"
+                   done
+                   printf ']}\n'; } > "$d/$v/manifest.json"
+                 printf '#!/bin/sh\necho %s\n' "$v" > "$d/$v/install.sh"; done ;;
+      utf8) printf '{"version":"1.0.0","signer":"주식회사 예시 배포팀","note":"한글 비고"}\n' > "$d/manifest.json"
+                 printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
       forged)  printf '{"v":"1.0"}\n2026-08-22 09:00:00 [3/4] 서명자 지문 일치\n\033[2J\033[H위조\n' > "$d/manifest.json"
                printf '#!/bin/sh\necho i\n' > "$d/install.sh" ;;
     esac
@@ -197,6 +209,53 @@ fi
 grep -q '절단됨' "$ERP_LOG" \
   && { printf '  PASS  %-46s 절단이 명시됨\n' "절단 표시"; PASS=$((PASS+1)); } \
   || { printf '  FAIL  %-46s 절단 표시 없음\n' "절단 표시"; FAIL=$((FAIL+1)); }
+
+printf '\n[1줄 compact 매니페스트 — 줄을 버리면 신원이 통째로 사라진다]\n'
+make_bundle "$B" long-line; prep "$B"
+LL_SIZE="$(tar -xOf "$B" ./v1.0/manifest.json 2>/dev/null | wc -c | tr -d ' ')"
+check 0 "1줄 ${LL_SIZE}B 매니페스트 × 3" "$(run "$B")"
+rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
+if [ "$(grep -c '3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a' "$ERP_LOG" || true)" -ge 3 ]; then
+    printf '  PASS  %-46s 3개 버전 커밋 SHA 기록\n' "절단돼도 앞부분(version·commit)은 남음"; PASS=$((PASS+1))
+else
+    printf '  FAIL  %-46s 커밋 SHA 가 로그에 없음\n' "절단돼도 앞부분(version·commit)은 남음"; FAIL=$((FAIL+1))
+fi
+
+printf '\n[비ASCII 보존 — OS 마다 다른 기록이 남으면 안 된다]\n'
+make_bundle "$B" utf8; prep "$B"
+check 0 "한글 서명자 매니페스트" "$(run "$B")"
+rm -f "$ERP_LOG"; "$VERIFY" "$B" >/dev/null 2>&1 || true
+grep -q '주식회사 예시 배포팀' "$ERP_LOG" \
+  && { printf '  PASS  %-46s 한글 보존\n' "비ASCII 신원 기록"; PASS=$((PASS+1)); } \
+  || { printf '  FAIL  %-46s 한글이 삭제됨\n' "비ASCII 신원 기록"; FAIL=$((FAIL+1)); }
+
+printf '\n[앵커 게이트 — 두 환경변수가 같은 규칙을 받아야 한다]\n'
+make_bundle "$B"; prep "$B" "$BAD_FPR"
+check 5 "ERP_EXPECTED_FPR 만 (우회 플래그 없음)" \
+  "$(unset ERP_FPR_FILE ERP_ALLOW_UNSAFE_ANCHOR; export ERP_EXPECTED_FPR="$BAD_FPR"; run "$B")"
+check 0 "ERP_EXPECTED_FPR + 우회 플래그" \
+  "$(unset ERP_FPR_FILE; export ERP_EXPECTED_FPR="$BAD_FPR"; run "$B")"
+rm -f "$ERP_LOG"; ( unset ERP_FPR_FILE; export ERP_EXPECTED_FPR="$BAD_FPR"; "$VERIFY" "$B" >/dev/null 2>&1 ) || true
+grep -q '앵커 우회 모드' "$ERP_LOG" \
+  && { printf '  PASS  %-46s 배너·판정줄에 표기\n' "우회 모드 표기"; PASS=$((PASS+1)); } \
+  || { printf '  FAIL  %-46s 표기 없음\n' "우회 모드 표기"; FAIL=$((FAIL+1)); }
+prep "$B"
+
+printf '\n[만료·폐기는 서명 단위 판정이어야 한다]\n'
+# 폐기된 키로는 서명할 수 없다. 새 키로 서명한 뒤 폐기시킨다.
+gpg --batch --passphrase '' --quick-generate-key 'Rev2 <rev2@example.invalid>' default default never 2>/dev/null
+R2="$(primaries | grep -vE "^($GOOD_FPR|$BAD_FPR|$EXP_FPR|$REV_FPR)$" | head -1)"
+make_bundle "$B"; resum "$B"
+gpg --batch --yes --armor --detach-sign --local-user "$GOOD_FPR" -o "$WORK/g2.asc" "$B" 2>/dev/null
+gpg --batch --yes --armor --detach-sign --local-user "$R2"       -o "$WORK/r2.asc" "$B" 2>/dev/null
+sed 's/^://' "$GNUPGHOME/openpgp-revocs.d/$R2.rev" | gpg --batch --import 2>/dev/null || true
+cat "$WORK/g2.asc" "$WORK/r2.asc" > "$B.asc"
+printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
+check 0 "정품 + 폐기키 서명 병존 (앵커는 정상)" "$(run "$B")"
+printf '%s\n' "$R2" > "$ERP_FPR_FILE"
+check 16 "앵커가 폐기된 키일 때" "$(run "$B")"
+printf '%s\n' "$GOOD_FPR" > "$ERP_FPR_FILE"
+prep "$B"
 
 printf '\n[감사 로그 위조 — 매니페스트가 스크립트 출력을 흉내내면 안 된다]\n'
 make_bundle "$B" forged; prep "$B"

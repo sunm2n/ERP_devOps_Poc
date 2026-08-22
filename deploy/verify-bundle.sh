@@ -48,7 +48,15 @@ SCRIPT_VERSION='1.1.0'
 # 종료 코드는 닫힌 집합이어야 한다. README 표가 자동화의 인터페이스이고, 폐쇄망에서
 # 표에 없는 코드는 담당자에게 '원인 불명' 과 같다. errexit 나 SIGPIPE 로 die() 를
 # 건너뛴 종료를 전부 1 로 정규화한다.
-KNOWN_EXITS=' 0 2 3 4 5 6 10 11 12 13 14 15 16 '
+KNOWN_EXITS=' 0 2 3 4 5 6 10 11 12 13 14 15 16 130 '
+on_signal() {   # 128+N. 수백 MB 해싱 구간에서 세션 끊김·타임아웃은 현실적인 종료 사유다
+    printf '\n  중단됨 (신호 %s)\n' "$1" >&2
+    printf '  조치: 검증이 끝나기 전에 중단되었습니다. **재운반이 아니라 재실행**이 정답입니다.\n' >&2
+    printf '        수백 MB 해싱에 시간이 걸립니다. 세션이 끊기지 않는 환경에서 다시 실행하십시오.\n' >&2
+    printf '  로그: %s\n\n' "${LOG:-<미설정>}" >&2
+    trap - EXIT
+    exit 130
+}
 on_exit() {
     local c=$?
     case "$KNOWN_EXITS" in
@@ -60,16 +68,25 @@ on_exit() {
     exit 1
 }
 trap on_exit EXIT
+trap 'on_signal INT'  INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP'  HUP
 
 DEFAULT_FPR_FILE='/etc/erp-deploy/expected-fingerprint'
 FPR_FILE="$DEFAULT_FPR_FILE"
 FPR_OVERRIDE=''
-if [ -n "${ERP_FPR_FILE:-}" ] && [ "$ERP_FPR_FILE" != "$DEFAULT_FPR_FILE" ]; then
+# 앵커 값을 밖에서 넣으려는 시도는 **한 곳에서** 처리한다. 경로(ERP_FPR_FILE)와
+# 값(ERP_EXPECTED_FPR)을 따로 다루면 한쪽만 막히고, 공격자는 안 막힌 쪽을 안내서에
+# 적으면 그만이다. 입력이 하나 늘어도 여기만 고치면 되게 둔다.
+ANCHOR_ENV=''
+[ -z "${ERP_FPR_FILE:-}" ] || [ "$ERP_FPR_FILE" = "$DEFAULT_FPR_FILE" ] || ANCHOR_ENV='ERP_FPR_FILE'
+[ -z "${ERP_EXPECTED_FPR:-}" ] || ANCHOR_ENV="${ANCHOR_ENV:+$ANCHOR_ENV, }ERP_EXPECTED_FPR"
+if [ -n "$ANCHOR_ENV" ]; then
     if [ -e "$DEFAULT_FPR_FILE" ]; then
         FPR_OVERRIDE='ignored'          # 사전 배치 앵커가 있으면 그것이 이긴다
     elif [ "${ERP_ALLOW_UNSAFE_ANCHOR:-}" = '1' ]; then
-        FPR_FILE="$ERP_FPR_FILE"
-        FPR_OVERRIDE='unsafe'           # 개발·테스트용. 판정 줄에 그렇게 찍는다
+        FPR_OVERRIDE='unsafe'           # 개발·테스트용. 판정 줄과 배너에 그렇게 찍는다
+        [ -z "${ERP_FPR_FILE:-}" ] || FPR_FILE="$ERP_FPR_FILE"
     else
         FPR_OVERRIDE='refused'
     fi
@@ -112,11 +129,27 @@ die() {   # 종료코드, 원인, 조치
 # 번들에서 나온 문자열은 그대로 찍지 않는다. 매니페스트에 스크립트 자기 출력과 똑같이
 # 생긴 줄을 넣으면 감사 로그가 위조되고, ANSI 이스케이프는 화면을 지운다.
 untrusted() {
-    tr -cd '[:print:]\n' | awk -v max=2048 '
-        BEGIN { n = 0; skipped = 0 }
-        { if (n + length($0) + 1 <= max) { n += length($0) + 1; print "      | " $0 }
-          else { skipped++ } }
-        END { if (skipped > 0) printf "      | ... (%d줄 더 있음, %d바이트에서 절단됨)\n", skipped, max }'
+    # 제어문자만 지운다. `tr -cd '[:print:]'` 는 GNU tr 이 바이트 기반이라 로케일과
+    # 무관하게 비ASCII 를 전부 삭제하고, 같은 번들의 한글 서명자가 Linux 에서만
+    # 사라진다 — OS 마다 다른 기록이 남는다.
+    tr -d '\000-\010\013\014\016-\037\177' | awk -v max=2048 '
+        BEGIN { n = 0; cut = 0; dropped = 0 }
+        {
+            if (n >= max) { dropped++; next }
+            room = max - n
+            if (length($0) <= room) { n += length($0) + 1; print "      | " $0 }
+            else {
+                # 줄을 버리지 않는다. 매니페스트는 흔히 1줄(compact JSON)이라
+                # 버리면 version·commit·digest 가 통째로 사라진다.
+                print "      | " substr($0, 1, room) "…"
+                n = max; cut = 1
+            }
+        }
+        END {
+            if (cut || dropped > 0)
+                printf "      | ... (%d바이트에서 절단됨%s)\n", max,
+                       (dropped > 0 ? sprintf(", 이후 %d줄 생략", dropped) : "")
+        }'
 }
 
 # 지문 정규화. 대역 외 지문은 메일·Windows PC 를 거쳐 오므로 CRLF·탭·4자리 공백
@@ -198,14 +231,14 @@ EXPECTED_FPR=""
 FPR_SOURCE=""
 case "$FPR_OVERRIDE" in
     refused)
-        die 5 "ERP_FPR_FILE 로 앵커 경로를 바꾸려 했습니다" \
+        die 5 "환경변수로 앵커 값을 넣으려 했습니다 ($ANCHOR_ENV)" \
             "앵커 값은 사전 배치된 위치에서만 옵니다. 번들에 딸려온 안내서를 따르지 마십시오 — 그 안내서는 검증 대상과 같은 경로로 왔습니다. 환경변수를 지우고 다시 실행하십시오." ;;
     unsafe)
         # 우회 모드에서도 지정한 경로가 없으면 '미지정' 으로 강등되면 안 된다.
-        [ -e "$FPR_FILE" ] || die 5 "지정한 기대 지문 파일이 없습니다: $FPR_FILE" \
+        [ -z "${ERP_FPR_FILE:-}" ] || [ -e "$FPR_FILE" ] || die 5 "지정한 기대 지문 파일이 없습니다: $FPR_FILE" \
             "ERP_FPR_FILE 로 경로를 지정했으나 그 파일이 없습니다. 앵커가 없는 상태로 검증이 통과하는 것을 막기 위해 거부합니다." ;;
     ignored)
-        say "      알림: ERP_FPR_FILE 이 설정되어 있으나 무시합니다 — 사전 배치 앵커가 우선입니다" ;;
+        say "      알림: $ANCHOR_ENV 이(가) 설정되어 있으나 무시합니다 — 사전 배치 앵커가 우선입니다" ;;
 esac
 if [ -e "$FPR_FILE" ]; then
     [ -f "$FPR_FILE" ] || die 5 "기대 지문 경로가 일반 파일이 아닙니다: $FPR_FILE" \
@@ -220,9 +253,9 @@ if [ -e "$FPR_FILE" ]; then
     if [ -n "${ERP_EXPECTED_FPR:-}" ]; then
         say "      알림: ERP_EXPECTED_FPR 이 설정되어 있으나 무시합니다 — 앵커 파일이 우선입니다"
     fi
-elif [ -n "${ERP_EXPECTED_FPR:-}" ]; then
+elif [ "$FPR_OVERRIDE" = 'unsafe' ] && [ -n "${ERP_EXPECTED_FPR:-}" ]; then
     EXPECTED_FPR="$(printf '%s' "$ERP_EXPECTED_FPR" | normalize_fpr)"
-    FPR_SOURCE="환경변수 ERP_EXPECTED_FPR"
+    FPR_SOURCE="환경변수 ERP_EXPECTED_FPR (앵커 우회 모드)"
 fi
 
 # --- 3. 서명 -----------------------------------------------------------
@@ -243,13 +276,44 @@ fi
 # EXPKEYSIG/REVKEYSIG 만 본다. 맨 KEYEXPIRED/KEYREVOKED 는 **이 서명과 무관한**
 # 키링 전역 통지라서, 구 키 만료 + 신 키 병존(= 키 회전 직후의 정상 상태)에서
 # 정상 번들을 거짓 거부한다.
-if status EXPKEYSIG; then
-    die 13 "이 번들에 서명한 키가 만료되었습니다" \
-        "공급사에 키 회전 여부를 확인하고 새 공개키와 지문을 대역 외로 받으십시오."
-fi
-if status REVKEYSIG; then
-    die 16 "이 번들에 서명한 키가 폐기되었습니다" \
-        "이 키로 서명된 번들은 신뢰할 수 없습니다. 즉시 공급사에 연락하십시오."
+# 만료·폐기 서명도 VALIDSIG 를 낸다(확인함). 따라서 키 ID 로 앵커와 대조해야 한다.
+# 전역 판정이면, 공격자가 일회용 키를 만들어 스스로 폐기한 뒤 .asc 에 서명 블록 하나만
+# 붙여서 — 번들은 손도 안 대고 — 모든 정품 번들에 exit 16 을 내게 할 수 있다.
+# 거짓 경보가 반복되면 그 경로가 안 믿긴다. exit 14 를 고친 이유와 같다.
+ANCHOR_KEY_STATUS="$(printf '%s\n' "$VERIFY_OUT" | awk -v a="$EXPECTED_FPR" '
+    /^\[GNUPG:\] VALIDSIG/  { sf[$3] = $3; pf[$3] = $NF }
+    /^\[GNUPG:\] EXPKEYSIG/ { expid[$3] = 1 }
+    /^\[GNUPG:\] REVKEYSIG/ { revid[$3] = 1 }
+    END {
+        if (a == "") exit
+        for (x in sf) {
+            if (x != a && pf[x] != a) continue
+            kid = substr(x, length(x) - 15)
+            if (kid in revid) { print "revoked"; exit }
+            if (kid in expid) { print "expired"; exit }
+        }
+    }')"
+
+if [ -n "$EXPECTED_FPR" ]; then
+    case "$ANCHOR_KEY_STATUS" in
+        expired) die 13 "등록된 공급사 키가 만료되었습니다" \
+            "공급사에 키 회전 여부를 확인하고 새 공개키와 지문을 대역 외로 받으십시오." ;;
+        revoked) die 16 "등록된 공급사 키가 폐기되었습니다" \
+            "이 키로 서명된 번들은 신뢰할 수 없습니다. 즉시 공급사에 연락하십시오." ;;
+    esac
+    if status EXPKEYSIG || status REVKEYSIG; then
+        say "      경고: 앵커와 무관한 만료·폐기 서명이 .asc 에 포함되어 있습니다 (판정에는 쓰지 않습니다)"
+    fi
+else
+    # 앵커 미지정이면 대조할 기준이 없다. 안전 측으로 기운다.
+    if status EXPKEYSIG; then
+        die 13 "이 번들에 서명한 키가 만료되었습니다" \
+            "공급사에 키 회전 여부를 확인하고 새 공개키와 지문을 대역 외로 받으십시오."
+    fi
+    if status REVKEYSIG; then
+        die 16 "이 번들에 서명한 키가 폐기되었습니다" \
+            "이 키로 서명된 번들은 신뢰할 수 없습니다. 즉시 공급사에 연락하십시오."
+    fi
 fi
 
 # VALIDSIG 의 3번째 필드는 '서명에 쓰인 키' 지문, 마지막 필드는 primary 키 지문이다.
@@ -257,7 +321,12 @@ fi
 # (`gpg --fingerprint` 가 보여주는 것). primary 로 대조하지 않으면 정상 번들이 거짓 거부된다.
 ALL_SIGNING="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $3}')"
 ALL_PRIMARY="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] VALIDSIG/{print $NF}')"
-SIG_COUNT="$(printf '%s\n' "$ALL_PRIMARY" | grep -c . || true)"
+BAD_IDS="$(printf '%s\n' "$VERIFY_OUT" | awk '/^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG)/{print $3}')"
+# grep 을 끼우지 않는다. 빈 입력에서 grep 이 1 을 반환하면 pipefail 이 스크립트를 죽인다.
+SIG_COUNT="$(printf '%s\n' "$ALL_SIGNING" | awk -v b="$BAD_IDS" '
+    BEGIN { n = split(b, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") bad[a[i]] = 1 }
+    NF && !(substr($0, length($0) - 15) in bad) { c++ }
+    END { print c + 0 }')"
 SIGNING_FPR="$(printf '%s\n' "$ALL_SIGNING" | head -1)"
 PRIMARY_FPR="$(printf '%s\n' "$ALL_PRIMARY" | head -1)"
 ACTUAL_FPR="${PRIMARY_FPR:-$SIGNING_FPR}"
@@ -325,7 +394,12 @@ VERSION_DIRS="$(printf '%s\n' "$INSTALL_DIRS" | grep -v '^\.$' || true)"
 MANIFEST_VDIRS="$(printf '%s\n' "$MANIFEST_DIRS" | grep -v '^\.$' || true)"
 
 MISSING_INSTALL="$(comm -13 <(printf '%s\n' "$VERSION_DIRS") <(printf '%s\n' "$MANIFEST_VDIRS") || true)"
-MISSING_MANIFEST="$(comm -23 <(printf '%s\n' "$INSTALL_DIRS") <(printf '%s\n' "$MANIFEST_DIRS") || true)"
+# 최상위 묶음 매니페스트가 있으면 레이아웃 A 다. 버전별 매니페스트 부재는 결함이 아니다.
+if printf '%s\n' "$MANIFEST_DIRS" | grep -qx '\.'; then
+    MISSING_MANIFEST=''
+else
+    MISSING_MANIFEST="$(comm -23 <(printf '%s\n' "$VERSION_DIRS") <(printf '%s\n' "$MANIFEST_VDIRS") || true)"
+fi
 
 if [ -n "$(printf '%s' "$MISSING_INSTALL" | tr -d '[:space:]')" ]; then
     say "      버전 매니페스트는 있으나 install.sh 가 없는 위치:"
@@ -363,7 +437,12 @@ fi
 
 {
     printf '\n'
-    printf '  검증 통과 (verify-bundle.sh %s)\n' "$SCRIPT_VERSION"
+    if [ "$FPR_OVERRIDE" = 'unsafe' ]; then
+        printf '  검증 통과 (verify-bundle.sh %s) — **앵커 우회 모드**\n' "$SCRIPT_VERSION"
+        printf '  경고: 앵커 값이 사전 배치본이 아니라 환경변수에서 왔습니다. 운영에 쓰지 마십시오.\n'
+    else
+        printf '  검증 통과 (verify-bundle.sh %s)\n' "$SCRIPT_VERSION"
+    fi
     printf '\n'
     printf '  이제 설치를 진행할 수 있습니다. 적용할 버전의 스크립트를 고르십시오:\n'
     printf "    tar -xf '%s' -C <작업디렉터리>\n" "$BUNDLE"
