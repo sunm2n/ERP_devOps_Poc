@@ -47,23 +47,17 @@ public sealed class DatabaseHealthCheck : IHealthCheck
             _connectionString = builder.ConnectionString;
             _endpoint = $"{builder.Host}:{builder.Port}/{builder.Database}";
         }
-        catch (ArgumentException ex)
+        catch (Exception)
         {
             // 파싱 실패도 검사 시점에 보고한다. 여기서 던지면 앱이 기동조차 못 하고
             // 폐쇄망에서는 그 이유가 화면에 안 나온다.
-            // **ParamName 에 어느 키가 틀렸는지가 들어 있고 값은 안 들어 있다** —
-            // 없으면 담당자에게 연결 문자열을 통째로 불러달라고 해야 하는데
-            // 그 안에 비밀번호가 있어 전화로 못 읽는다.
+            // 어느 키가 틀렸는지는 Describe 가 ArgumentException.ParamName 으로 낸다 —
+            // **ParamName 에는 키 이름만 들어 있고 값은 안 들어 있다.** 없으면 담당자에게
+            // 연결 문자열을 통째로 불러달라고 해야 하는데 그 안에 비밀번호가 있어
+            // 전화로 못 읽는다. 여기서 또 붙이면 한 줄에 두 번 나온다.
             _connectionString = connectionString;
             _connectTimeoutSeconds = Math.Max(1, (int)Math.Floor(timeout.TotalSeconds) - 1);
-            // 키 이름은 Describe 가 낸다. 여기서 또 붙이면 한 줄에 두 번 나온다.
             _endpoint = "<연결 문자열 파손>";
-        }
-        catch (Exception ex)
-        {
-            _connectionString = connectionString;
-            _connectTimeoutSeconds = Math.Max(1, (int)Math.Floor(timeout.TotalSeconds) - 1);
-            _endpoint = $"<연결 문자열 파손: {ex.GetType().Name}>";
         }
     }
 
