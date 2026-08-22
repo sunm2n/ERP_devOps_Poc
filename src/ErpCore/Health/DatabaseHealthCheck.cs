@@ -107,6 +107,9 @@ public sealed class DatabaseHealthCheck : IHealthCheck
             => $"ConnectTimeout after {_connectTimeoutSeconds}s (방화벽·라우팅 확인)",
         ArgumentException ae when ae.ParamName is { Length: > 0 } key
             => $"ArgumentException '{key}' 키",
-        _ => ex.GetType().Name,
+        // 표에 없는 토큰이 나오면 담당자는 무엇을 할지 모른다. 종료 코드는 닫힌 집합으로
+        // 만들어 놓고 진단 토큰만 열어두면 같은 구멍이다 — 예: 포트는 열려 있는데
+        // Postgres 가 아닌 경우(포워딩 오설정, 앞단 프록시)가 여기로 온다.
+        _ => $"{ex.GetType().Name} (표에 없는 원인 — 로그 전문과 함께 공급사 문의)",
     };
 }

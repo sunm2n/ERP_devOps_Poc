@@ -114,6 +114,10 @@ exit 14("즉시 연락")를 반복 생성할 수 있다 — 거짓 경보가 반
 | `NpgsqlException SocketException ConnectionRefused` | 포트는 닿는데 거부 | **DB 컨테이너가 안 떴다** |
 | `ConnectTimeout after Ns (방화벽·라우팅 확인)` | 패킷이 사라짐 | **고객사 망 담당자 소관.** 폐쇄망 최초 설치에서 가장 흔하다 |
 | `ArgumentException '<키>' 키` | 연결 문자열 파손 | 그 키만 확인하면 된다 (값을 불러줄 필요 없음) |
+| **그 외 토큰** (`… (표에 없는 원인 …)`) | 분류되지 않음 | **재운반 불필요.** 로그 전문과 함께 공급사 문의 |
+
+**이 표는 닫힌 집합이다.** 종료 코드를 닫아 놓고 진단 토큰만 열어두면 같은 구멍이다 —
+예를 들어 포트는 열려 있는데 Postgres 가 아닌 경우(포워딩 오설정, 앞단 프록시)가 마지막 행으로 온다.
 
 `connectionSource` 도 함께 본다 — `default` 면 **환경변수 주입 자체가 누락**된 것이고,
 그때 나오는 `SocketException`(localhost 를 두드림)은 DB 장애가 아니다.
@@ -129,24 +133,57 @@ exit 14("즉시 연락")를 반복 생성할 수 있다 — 거짓 경보가 반
 | 대기 대상 | `GET http://127.0.0.1:8080/health` 가 **200** |
 | 폴링 간격 | 2초 |
 | 최대 대기 | **600초** (`docker load` 수백 MB 3~5분이 앞에 붙는다) |
-| 초과 시 종료 코드 | **20** (`verify-bundle.sh` 의 0~16·130 과 겹치지 않게 20번대를 쓴다) |
-| 503 수신 시 | 상한을 다 기다리지 않고 **즉시 본문을 출력**한다 — 떴는데 Unhealthy 면 원인이 이미 응답에 있다 |
+| **503 수신 시** | **본문을 출력하되 계속 폴링한다.** DB 가 앱보다 늦게 뜨는 것은 정상이라 **첫 폴링은 거의 항상 503** 이다. 여기서 즉시 종료하면 정상 배포가 t+0s 에 실패하고, 그때 출력된 `HostNotFound` 가 담당자를 `/etc/hosts` 로 보낸다 — 정답은 "10초 더 기다린다" 다 |
 | `build` 대조 | 번들 매니페스트의 `commit`(SHA 40자)이 헬스 응답 `build` 의 **`+` 뒤 문자열과 앞자리 일치**하는지 본다. `build` 는 `1.0.0+<SHA>` 형식이라 **순진한 동등 비교는 항상 실패한다** |
 | 본문 저장 | `curl -sf` 를 쓰지 않는다 — `-f` 는 비-2xx 에서 본문을 버린다. `curl -s -o /var/log/erp-install-health.json -w '%{http_code}'` |
 
+**종료 코드 — `verify-bundle.sh` 와 같은 규율로 닫는다.** 자동화가 읽는 것은 종료 코드지
+한국어 문장이 아니다. 20번대를 쓴다(0~16·130 은 `verify-bundle.sh` 것).
+
+| 코드 | 원인 | 고객사가 할 일 |
+| --- | --- | --- |
+| 0 | 적용 완료 (`/health` 200 + `build` 일치) | 없음 |
+| 20 | 대기 상한 600초 초과 | 마지막 `/health` 본문의 원인 토큰을 위 표에서 찾는다 |
+| 21 | 200 이지만 `build` 불일치 | **컨테이너가 교체되지 않았다.** 재적용 후에도 같으면 공급사 문의 |
+| 22 | `buildIdentity` 가 `missing-commit-sha` | **재운반 불필요.** 번들 생성 측 문제 — `build` 대조가 무의미하므로 공급사 문의 |
+| 23 | `curl`/`wget` 없음, 또는 응답 코드 `000` | VM 사전 요구사항 미충족 (포트 매핑 `-p 8080:8080` 누락 포함) |
+
+**21·22 를 나눈 이유**: 21 은 재적용으로 고쳐질 수 있고 22 는 절대 안 고쳐진다.
+같은 코드로 묶으면 담당자가 고쳐지지 않을 것을 반복한다.
+
 ```sh
-# 예시
+# 503 에서 종료하지 않는다 — 첫 폴링은 거의 항상 503 이다.
+LOG=/var/log/erp-install-health.json
+EXPECTED_SHA="$(sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p' manifest.json)"
+command -v curl >/dev/null || { echo "curl 이 없습니다"; exit 23; }
+
 deadline=$(( $(date +%s) + 600 ))
+last=''
 while :; do
-  code="$(curl -s -o /var/log/erp-install-health.json -w '%{http_code}'           http://127.0.0.1:8080/health || echo 000)"
+  # curl 이 실패하면 -w 가 이미 000 을 찍는다. `|| echo 000` 을 붙이면 000000 이 된다.
+  code="$(curl -s -o "$LOG" -w '%{http_code}' http://127.0.0.1:8080/health)" || code=000
   [ "$code" = 200 ] && break
-  if [ "$code" = 503 ]; then
-      echo "기동했으나 준비되지 않았습니다:"; cat /var/log/erp-install-health.json; exit 20
+  [ "$code" = "$last" ] || { echo "[$code] 대기 중:"; cat "$LOG" 2>/dev/null; echo; last="$code"; }
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "대기 상한 600초 초과 (마지막 응답 코드 $code)"; cat "$LOG" 2>/dev/null
+    [ "$code" = 000 ] && exit 23 || exit 20
   fi
-  [ "$(date +%s)" -lt "$deadline" ] || { echo "대기 상한 초과"; cat /var/log/erp-install-health.json; exit 20; }
   sleep 2
 done
+
+# 인코더가 relaxed 라 `+` 와 한글이 원문으로 나온다 — jq 없이 셸만으로 뽑힌다.
+grep -q '"buildIdentity":"missing-commit-sha"' "$LOG" && {
+  echo "빌드 신원 없음 — build 대조가 무의미합니다"; exit 22; }
+actual="$(sed -n 's/.*"build":"[^+]*+\([0-9a-f]*\)".*/\1/p' "$LOG")"
+case "$EXPECTED_SHA" in
+  "$actual"*) : ;;   # 앞자리 일치
+  *) echo "build 불일치: 기대 $EXPECTED_SHA / 실제 $actual"; exit 21 ;;
+esac
+echo "적용 완료"
 ```
+
+**`127.0.0.1:8080` 에 닿으려면 컨테이너 포트 매핑(`-p 8080:8080`)이 필요하다.**
+그 결정은 #12 소관이고, 누락되면 응답 코드가 `000` 으로 나온다 (종료 코드 23).
 
 **`curl` 이 없는 VM 이 있다.** `bash /dev/tcp` 는 상태 코드도 본문도 못 읽으므로 폴백이
 아니다 — `curl` 또는 `wget` 을 VM 사전 요구사항에 넣는다.

@@ -3,6 +3,7 @@ using ErpCore.Orders;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using System.Reflection;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -31,7 +32,7 @@ if (!string.IsNullOrWhiteSpace(rawTimeout))
 {
     if (double.TryParse(rawTimeout, System.Globalization.NumberStyles.Float,
             System.Globalization.CultureInfo.InvariantCulture, out var parsed)
-        && parsed is > 0 and <= 300)
+        && parsed is >= 2 and <= 300)
     {
         timeoutSeconds = parsed;
     }
@@ -39,7 +40,7 @@ if (!string.IsNullOrWhiteSpace(rawTimeout))
     {
         timeoutWarning =
             $"ERP_HEALTH_TIMEOUT_SECONDS 값을 해석할 수 없어 기본값 {timeoutSeconds}초를 씁니다 " +
-            "(0 초과 300 이하의 숫자여야 합니다. 예: 3 또는 2.5)";
+            "(2 이상 300 이하여야 합니다 — 2 미만이면 연결 타임아웃과 겹쳐 방화벽·라우팅 진단이 사라집니다)";
     }
 }
 var healthTimeout = TimeSpan.FromSeconds(timeoutSeconds);
@@ -159,7 +160,28 @@ static Task WriteHealthResponse(
             }),
     };
 
-    return context.Response.WriteAsync(JsonSerializer.Serialize(payload));
+    return context.Response.WriteAsync(JsonSerializer.Serialize(payload, HealthJson.Options));
+}
+
+/// <summary>
+/// 헬스 응답 직렬화 옵션.
+/// </summary>
+/// <remarks>
+/// **기본 인코더는 `+` 와 비ASCII 를 `\uXXXX` 로 이스케이프한다.** 그러면
+/// `deploy/README.md` 의 계약 두 개가 동시에 거짓이 된다 —
+/// (1) `build` 대조의 "`+` 뒤 문자열" 이 본문에 없어 `cut -d+` 가 실패하고,
+/// (2) 담당자가 503 본문에서 보는 것이 `\uBC29\uD654...` 라 조치 주체가 갈리는
+/// 한글 부분이 통째로 사라진다. 폐쇄망은 우리가 응답을 못 보는 유일한 구간이라
+/// **화면에 찍히는 바이트가 곧 계약**이다.
+///
+/// `/health` 응답은 HTML 컨텍스트에 삽입되지 않으므로 relaxed 인코딩이 안전하다.
+/// </remarks>
+file static class HealthJson
+{
+    public static readonly JsonSerializerOptions Options = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
 }
 
 /// <summary>통합 테스트에서 참조하기 위한 진입점 표식.</summary>

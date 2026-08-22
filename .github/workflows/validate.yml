@@ -79,6 +79,21 @@ jobs:
         # 동작한다 — src/ErpCore/ErpCore.csproj 만 있던 시점에 이 스텝이 MSB1003 으로 깨졌다.
         run: |
           set -euo pipefail
+          TMP="$(mktemp -d)"
+
+          # **잠금 파일 검사는 두 분기 공통이다.** 잠금 모드 복원은 잠금 파일이 없으면
+          # 실패하지 않고 **조용히 만들어 준다**(실측) — 재현성은 이 검사가 만든다.
+          find src -name '*.csproj' | sort -u > "$TMP/all.txt"
+          missing=0
+          while IFS= read -r proj; do
+            [ -f "$(dirname "$proj")/packages.lock.json" ] || {
+              echo "::error::잠금 파일 없음: $proj"
+              echo "::error::  복구: dotnet restore '$proj' 후 packages.lock.json 을 커밋하십시오."
+              echo "::error::  (정확히 global.json 의 SDK 가 필요합니다 — 없으면 sdk:10.0 컨테이너로)"
+              missing=1
+            }
+          done < "$TMP/all.txt"
+          [ "$missing" -eq 0 ] || exit 1
 
           sln="$(find src -maxdepth 2 \( -name '*.sln' -o -name '*.slnx' \) | sort | head -1)"
 
@@ -105,32 +120,24 @@ jobs:
             printf '%s\n' "$sln_out"
             exit 1
           fi
+          # `dotnet sln list` 가 내는 경로는 **솔루션 디렉터리 기준 상대경로**다.
+          # 접두사를 'src/' 로 하드코딩하면 깊이 2 솔루션에서 정상 등록을 '미등록' 으로
+          # 보고한다 (실측: src/App/App.slnx + src/App/Lib/Lib.csproj).
+          slndir="$(dirname "$sln")"
+          # grep 이 0건이면 pipefail 이 무진단으로 죽인다 — '솔루션은 만들었는데 아직
+          # add 안 한' 상태가 바로 이 검사가 발화해야 하는 입력이다. `|| :` 로 받는다.
           printf '%s\n' "$sln_out" \
-            | grep -E '\.csproj$' \
+            | { grep -E '\.csproj$' || :; } \
             | tr '\\' '/' \
-            | sed 's#^#src/#' \
-            | sort -u > /tmp/listed.txt
-          find src -name '*.csproj' | sort -u > /tmp/found.txt
-
-          if ! diff -u /tmp/listed.txt /tmp/found.txt > /tmp/cov.diff; then
+            | sed "s#^#$slndir/#" \
+            | sort -u > "$TMP/listed.txt"
+          if ! diff -u "$TMP/listed.txt" "$TMP/all.txt" > "$TMP/cov.diff"; then
             echo "::error::솔루션 등록 목록과 src 아래 실제 프로젝트가 다릅니다."
             echo "::error::등록되지 않은 프로젝트는 빌드되지 않은 채 CI 가 통과합니다."
             echo '--- 솔루션 등록 (-) vs 실제 발견 (+) ---'
-            cat /tmp/cov.diff
+            cat "$TMP/cov.diff"
             exit 1
           fi
-
-          # 잠금 파일이 없는 프로젝트는 잠금 모드 복원을 **조용히 통과**한다.
-          # RestorePackagesWithLockFile 은 Directory.Build.props 에 있지만, 그걸
-          # 우회하는 프로젝트가 생기면 재현성 보증이 그 프로젝트에만 없어진다.
-          missing=0
-          while IFS= read -r proj; do
-            [ -f "$(dirname "$proj")/packages.lock.json" ] || {
-              echo "::error::잠금 파일 없음: $proj"
-              missing=1
-            }
-          done < /tmp/found.txt
-          [ "$missing" -eq 0 ] || exit 1
 
           # 잠금 파일과 어긋나면 실패시킨다. 같은 커밋이 다른 의존성으로 복원되면
           # plan.md 1단계의 "같은 커밋 -> 같은 이미지" 근거가 사라진다.
