@@ -15,7 +15,8 @@
 #  21   200 이지만 build 불일치 — 컨테이너가 교체되지 않았다. 재적용으로 고쳐질 수 있다
 #  22   buildIdentity 가 missing-commit-sha, 또는 build 에서 SHA 를 뽑지 못함 —
 #       대조 자체가 무의미하다. **재적용으로 안 고쳐진다** (번들 생성 측 문제)
-#  23   curl/wget 없음, 또는 응답 코드 000 (포트 매핑 -p 8080:8080 누락 포함)
+#  23   curl 없음, 또는 응답 코드 000 (포트 매핑 -p 8080:8080 누락 포함)
+#  24   로그를 기록할 수 없음
 #
 # 21 과 22 를 나눈 이유: 21 은 재적용으로 고쳐질 수 있고 22 는 절대 안 고쳐진다.
 # 같은 코드로 묶으면 담당자가 고쳐지지 않을 것을 반복한다.
@@ -28,13 +29,26 @@ EXPECTED_SHA="${2:-}"
 DEADLINE_SECONDS="${3:-600}"
 LOG="${ERP_HEALTH_LOG:-/var/log/erp-install-health.json}"
 INTERVAL="${ERP_POLL_INTERVAL:-2}"
+# 숫자가 아니면 sleep 이 매번 실패해 루프가 CPU 를 물고 스핀한다.
+case "$INTERVAL" in
+    ''|*[!0-9.]*|.) INTERVAL=2 ;;
+esac
+[ "$INTERVAL" != 0 ] || INTERVAL=2
 
 command -v curl >/dev/null 2>&1 || {
     printf 'curl 이 없습니다. VM 사전 요구사항을 확인하십시오.\n' >&2
     exit 23
 }
 
-mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+# **로그 선검사.** curl 은 -o 파일을 못 열면 stdout 에 상태 코드를 찍으면서 rc=23 으로
+# 끝난다. 아래 `|| code=000` 은 종료 코드만 보므로 이미 받은 200 을 000 으로 덮고,
+# **완전히 정상인 배포가 상한을 다 태운 뒤 '포트 매핑을 확인하십시오' 로 죽는다.**
+# verify-bundle.sh 가 exit 3 으로 하는 것과 같은 처리다 — 여기만 빠져 있었다.
+if ! { mkdir -p "$(dirname "$LOG")" && : >> "$LOG"; } 2>/dev/null; then
+    printf '로그를 기록할 수 없습니다: %s\n' "$LOG" >&2
+    printf '조치: 쓰기 가능한 경로를 지정하십시오 —  ERP_HEALTH_LOG=./health.json %s ...\n' "$0" >&2
+    exit 24
+fi
 
 deadline=$(( $(date +%s) + DEADLINE_SECONDS ))
 last=''
@@ -44,7 +58,8 @@ while :; do
     # **매 폴링마다 비운다.** curl 은 연결 실패 시 -o 파일을 건드리지 않으므로,
     # 비우지 않으면 code=000 화면에 직전 폴링의 낡은 본문이 함께 찍힌다 —
     # 담당자는 포트 매핑 문제를 DB 문제로 쫓게 된다.
-    : > "$LOG" 2>/dev/null || true
+    # 리다이렉션은 왼쪽부터 처리되므로 `: > "$LOG" 2>/dev/null` 은 자기 에러를 못 지운다.
+    : 2>/dev/null > "$LOG"
 
     code="$(curl -s -o "$LOG" -w '%{http_code}' "$URL")" || code=000
 
@@ -87,7 +102,7 @@ actual="${build#*+}"
 # **빈 값을 통과시키지 않는다.** `case "$EXPECTED" in "$actual"*)` 는 actual 이 비면
 # 빈 패턴이 되어 무엇에나 일치한다 — `git describe --always --dirty` 처럼 SHA 뒤에
 # 접미어가 붙는 흔한 스탬핑에서 대조가 조용히 통과하던 자리다.
-if [ -z "$build" ] || [ "$actual" = "$build" ]; then
+if [ -z "$build" ] || [ -z "$actual" ] || [ "$actual" = "$build" ]; then
     printf 'build 에서 SHA 를 뽑지 못했습니다: %s\n' "${build:-<없음>}" >&2
     exit 22
 fi

@@ -75,6 +75,12 @@ for b in "1.0.0+${SHA:0:7}-dirty" "1.0.0+feature-x" "1.0.0+3C0E93CA" "1.0.0"; do
 done
 respond 200 "{\"status\":\"Healthy\",\"build\":\"1.0.0\",\"buildIdentity\":\"missing-commit-sha\"}"
 check 22 "buildIdentity=missing-commit-sha" "$(run "$SHA")"
+# `+` 로 끝나면 actual 이 빈 문자열이 되고, case 의 빈 패턴이 무엇에나 일치한다.
+# buildIdentity 도 못 잡는다 — Contains('+') 기준이라 ok 로 나간다.
+for b in "1.0.0+" "+"; do
+  respond 200 "{\"status\":\"Healthy\",\"build\":\"$b\",\"buildIdentity\":\"ok\"}"
+  check 22 "build=$b (+ 뒤가 빔)" "$(run "$SHA")"
+done
 
 printf '\n[503 은 종료가 아니라 대기다]\n'
 respond 503 '{"status":"Unhealthy","checks":{"database":{"description":"database unreachable"}}}'
@@ -93,6 +99,17 @@ check 23 "연결 불가 (code=000)" "$(run "$SHA" 3)"
 printf '  로그에 낡은 본문이 남았는가: '
 if [ -s "$ERP_HEALTH_LOG" ]; then printf 'FAIL (%s바이트 잔존)\n' "$(wc -c < "$ERP_HEALTH_LOG" | tr -d ' ')"; FAIL=$((FAIL+1))
 else printf 'PASS (비어 있음)\n'; PASS=$((PASS+1)); fi
+
+printf '\n[로그 경로 — 정상 배포를 000 으로 오진하면 안 된다]\n'
+start_server || { echo "서버 재기동 실패"; exit 1; }
+respond 200 "$OK_BODY"
+check 24 "로그를 기록할 수 없음" "$(ERP_HEALTH_LOG=/proc/nonexistent/h.json "$WAIT" "http://127.0.0.1:$PORT/health" "$SHA" 4 >/dev/null 2>&1; printf '%s' $?)"
+out="$(ERP_HEALTH_LOG=/proc/nonexistent/h.json "$WAIT" "http://127.0.0.1:$PORT/health" "$SHA" 4 2>&1 || true)"
+case "$out" in
+  *"포트 매핑"*) printf '  FAIL  %-44s 포트 매핑을 안내함 (오진)\n' "오진하지 않는다"; FAIL=$((FAIL+1)) ;;
+  *) printf '  PASS  %-44s 로그 경로 문제로 안내\n' "오진하지 않는다"; PASS=$((PASS+1)) ;;
+esac
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null || true; SRV_PID=''
 
 printf '\n[전제]\n'
 D="$WORK/nocurl"; mkdir -p "$D"
